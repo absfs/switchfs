@@ -11,16 +11,12 @@ import (
 
 // SwitchFS implements absfs.FileSystem with routing
 type SwitchFS struct {
-	router         Router
-	defaultFS      absfs.FileSystem
-	currentDir     string
-	separator      uint8
-	listSep        uint8
-	tempDir        string
-	healthMonitor  *HealthMonitor
-	retryConfig    *RetryConfig
-	middleware     []Middleware
-	stats          *StatsCollector
+	router     Router
+	defaultFS  absfs.FileSystem
+	currentDir string
+	separator  uint8
+	listSep    uint8
+	tempDir    string
 }
 
 // Ensure SwitchFS implements absfs.FileSystem
@@ -189,7 +185,7 @@ func (fs *SwitchFS) Rename(oldpath, newpath string) error {
 	return fs.crossBackendMove(oldpath, newpath, oldBackend, newBackend)
 }
 
-// crossBackendMove handles moving files across different backends
+// crossBackendMove handles moving files and directories across different backends
 func (fs *SwitchFS) crossBackendMove(oldpath, newpath string, oldBackend, newBackend absfs.FileSystem) error {
 	// Get file info
 	info, err := oldBackend.Stat(oldpath)
@@ -197,11 +193,17 @@ func (fs *SwitchFS) crossBackendMove(oldpath, newpath string, oldBackend, newBac
 		return err
 	}
 
-	// Handle directories
+	// Handle directories recursively
 	if info.IsDir() {
-		return ErrCrossBackendOperation
+		return fs.crossBackendMoveDir(oldpath, newpath, oldBackend, newBackend, info)
 	}
 
+	// Handle regular files
+	return fs.crossBackendMoveFile(oldpath, newpath, oldBackend, newBackend)
+}
+
+// crossBackendMoveFile handles moving a single file across backends
+func (fs *SwitchFS) crossBackendMoveFile(oldpath, newpath string, oldBackend, newBackend absfs.FileSystem) error {
 	// Open source file
 	src, err := oldBackend.Open(oldpath)
 	if err != nil {
@@ -228,6 +230,54 @@ func (fs *SwitchFS) crossBackendMove(oldpath, newpath string, oldBackend, newBac
 
 	// Remove source
 	return oldBackend.Remove(oldpath)
+}
+
+// crossBackendMoveDir handles moving a directory recursively across backends
+func (fs *SwitchFS) crossBackendMoveDir(oldpath, newpath string, oldBackend, newBackend absfs.FileSystem, info os.FileInfo) error {
+	// Create destination directory with same permissions
+	if err := newBackend.MkdirAll(newpath, info.Mode()); err != nil {
+		return err
+	}
+
+	// Open source directory
+	dir, err := oldBackend.Open(oldpath)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+
+	// Read all directory entries
+	entries, err := dir.Readdir(-1)
+	if err != nil {
+		return err
+	}
+
+	// Copy each entry recursively
+	for _, entry := range entries {
+		// Skip "." and ".." entries to avoid infinite recursion
+		name := entry.Name()
+		if name == "." || name == ".." {
+			continue
+		}
+
+		srcPath := filepath.Join(oldpath, name)
+		dstPath := filepath.Join(newpath, name)
+
+		if entry.IsDir() {
+			// Recursively copy subdirectory
+			if err := fs.crossBackendMoveDir(srcPath, dstPath, oldBackend, newBackend, entry); err != nil {
+				return err
+			}
+		} else {
+			// Copy file
+			if err := fs.crossBackendMoveFile(srcPath, dstPath, oldBackend, newBackend); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Remove source directory after successful copy
+	return oldBackend.RemoveAll(oldpath)
 }
 
 // Stat returns file information
