@@ -45,6 +45,12 @@ type Route struct {
 	// Failover is an optional backup backend
 	Failover absfs.FileSystem
 
+	// Condition is an optional condition that must be met for routing
+	Condition RouteCondition
+
+	// Rewriter optionally transforms paths before passing to backend
+	Rewriter PathRewriter
+
 	// compiled stores the compiled pattern matcher
 	compiled patternMatcher
 }

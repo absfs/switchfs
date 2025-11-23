@@ -11,12 +11,16 @@ import (
 
 // SwitchFS implements absfs.FileSystem with routing
 type SwitchFS struct {
-	router      Router
-	defaultFS   absfs.FileSystem
-	currentDir  string
-	separator   uint8
-	listSep     uint8
-	tempDir     string
+	router         Router
+	defaultFS      absfs.FileSystem
+	currentDir     string
+	separator      uint8
+	listSep        uint8
+	tempDir        string
+	healthMonitor  *HealthMonitor
+	retryConfig    *RetryConfig
+	middleware     []Middleware
+	stats          *StatsCollector
 }
 
 // Ensure SwitchFS implements absfs.FileSystem
@@ -53,6 +57,30 @@ func (fs *SwitchFS) getBackend(path string) (absfs.FileSystem, error) {
 		return nil, ErrNoRoute
 	}
 	return backend, err
+}
+
+// getBackendAndRewrite finds the backend and rewrites the path if needed
+func (fs *SwitchFS) getBackendAndRewrite(path string, info os.FileInfo) (absfs.FileSystem, string, error) {
+	// Try to route with file info for condition evaluation
+	route, err := fs.router.RouteWithInfo(path, info)
+	if err == ErrNoRoute {
+		// Use default backend if no route matches
+		if fs.defaultFS != nil {
+			return fs.defaultFS, path, nil
+		}
+		return nil, path, ErrNoRoute
+	}
+	if err != nil {
+		return nil, path, err
+	}
+
+	// Apply path rewriter if present
+	rewrittenPath := path
+	if route.Rewriter != nil {
+		rewrittenPath = route.Rewriter.Rewrite(path)
+	}
+
+	return route.Backend, rewrittenPath, nil
 }
 
 // Separator returns the path separator
