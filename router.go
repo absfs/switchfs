@@ -4,7 +4,6 @@ import (
 	"os"
 	"sort"
 	"sync"
-	"time"
 
 	"github.com/absfs/absfs"
 )
@@ -31,22 +30,12 @@ type Router interface {
 type router struct {
 	mu     sync.RWMutex
 	routes []Route
-	cache  *RouteCache
 }
 
 // NewRouter creates a new router instance
 func NewRouter() Router {
 	return &router{
 		routes: make([]Route, 0),
-		cache:  nil, // Caching disabled by default
-	}
-}
-
-// NewRouterWithCache creates a new router instance with caching enabled
-func NewRouterWithCache(maxCacheSize int, cacheTTL time.Duration) Router {
-	return &router{
-		routes: make([]Route, 0),
-		cache:  NewRouteCache(maxCacheSize, cacheTTL),
 	}
 }
 
@@ -81,11 +70,6 @@ func (r *router) AddRoute(route Route) error {
 		return r.routes[i].Priority > r.routes[j].Priority
 	})
 
-	// Invalidate cache since routes changed
-	if r.cache != nil {
-		r.cache.Clear()
-	}
-
 	return nil
 }
 
@@ -98,12 +82,6 @@ func (r *router) RemoveRoute(pattern string) error {
 		if route.Pattern == pattern {
 			// Remove the route
 			r.routes = append(r.routes[:i], r.routes[i+1:]...)
-
-			// Invalidate cache since routes changed
-			if r.cache != nil {
-				r.cache.Clear()
-			}
-
 			return nil
 		}
 	}
@@ -113,29 +91,12 @@ func (r *router) RemoveRoute(pattern string) error {
 
 // Route finds the backend for a given path
 func (r *router) Route(path string) (absfs.FileSystem, error) {
-	// Check cache first
-	if r.cache != nil {
-		if idx, ok := r.cache.Get(path); ok {
-			r.mu.RLock()
-			if idx >= 0 && idx < len(r.routes) {
-				backend := r.routes[idx].Backend
-				r.mu.RUnlock()
-				return backend, nil
-			}
-			r.mu.RUnlock()
-		}
-	}
-
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	// Iterate through routes in priority order
-	for i, route := range r.routes {
+	for _, route := range r.routes {
 		if route.compiled != nil && route.compiled.Match(path) {
-			// Cache the result
-			if r.cache != nil {
-				r.cache.Set(path, i)
-			}
 			return route.Backend, nil
 		}
 	}
