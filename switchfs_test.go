@@ -443,3 +443,575 @@ func TestSwitchFS_OperationRouting(t *testing.T) {
 		t.Errorf("backend1.openFileCount = %v, want 1", backend1.openFileCount)
 	}
 }
+
+// trackingMockFS is a mock that tracks which operations were called
+type trackingMockFS struct {
+	name           string
+	lastOp         string
+	lastPath       string
+	lastMode       os.FileMode
+	lastAtime      time.Time
+	lastMtime      time.Time
+	lastUid        int
+	lastGid        int
+	lastSize       int64
+	returnErr      error
+	returnFileInfo os.FileInfo
+}
+
+func (m *trackingMockFS) Open(name string) (absfs.File, error) {
+	m.lastOp = "Open"
+	m.lastPath = name
+	return nil, m.returnErr
+}
+
+func (m *trackingMockFS) Create(name string) (absfs.File, error) {
+	m.lastOp = "Create"
+	m.lastPath = name
+	return nil, m.returnErr
+}
+
+func (m *trackingMockFS) Remove(name string) error {
+	m.lastOp = "Remove"
+	m.lastPath = name
+	return m.returnErr
+}
+
+func (m *trackingMockFS) OpenFile(name string, flag int, perm os.FileMode) (absfs.File, error) {
+	m.lastOp = "OpenFile"
+	m.lastPath = name
+	m.lastMode = perm
+	return nil, m.returnErr
+}
+
+func (m *trackingMockFS) Mkdir(name string, perm os.FileMode) error {
+	m.lastOp = "Mkdir"
+	m.lastPath = name
+	m.lastMode = perm
+	return m.returnErr
+}
+
+func (m *trackingMockFS) MkdirAll(name string, perm os.FileMode) error {
+	m.lastOp = "MkdirAll"
+	m.lastPath = name
+	m.lastMode = perm
+	return m.returnErr
+}
+
+func (m *trackingMockFS) Rename(oldpath, newpath string) error {
+	m.lastOp = "Rename"
+	m.lastPath = oldpath
+	return m.returnErr
+}
+
+func (m *trackingMockFS) Stat(name string) (os.FileInfo, error) {
+	m.lastOp = "Stat"
+	m.lastPath = name
+	return m.returnFileInfo, m.returnErr
+}
+
+func (m *trackingMockFS) Chmod(name string, mode os.FileMode) error {
+	m.lastOp = "Chmod"
+	m.lastPath = name
+	m.lastMode = mode
+	return m.returnErr
+}
+
+func (m *trackingMockFS) Chtimes(name string, atime time.Time, mtime time.Time) error {
+	m.lastOp = "Chtimes"
+	m.lastPath = name
+	m.lastAtime = atime
+	m.lastMtime = mtime
+	return m.returnErr
+}
+
+func (m *trackingMockFS) Chown(name string, uid, gid int) error {
+	m.lastOp = "Chown"
+	m.lastPath = name
+	m.lastUid = uid
+	m.lastGid = gid
+	return m.returnErr
+}
+
+func (m *trackingMockFS) RemoveAll(path string) error {
+	m.lastOp = "RemoveAll"
+	m.lastPath = path
+	return m.returnErr
+}
+
+func (m *trackingMockFS) Truncate(name string, size int64) error {
+	m.lastOp = "Truncate"
+	m.lastPath = name
+	m.lastSize = size
+	return m.returnErr
+}
+
+func (m *trackingMockFS) Separator() uint8     { return '/' }
+func (m *trackingMockFS) ListSeparator() uint8 { return ':' }
+func (m *trackingMockFS) Chdir(dir string) error { return nil }
+func (m *trackingMockFS) Getwd() (string, error) { return "/", nil }
+func (m *trackingMockFS) TempDir() string { return "/tmp" }
+
+func TestSwitchFS_Mkdir(t *testing.T) {
+	backend := &trackingMockFS{name: "test"}
+
+	fs, err := New(
+		WithRoute("/data", backend, WithPriority(100)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	t.Run("successful mkdir", func(t *testing.T) {
+		err := fs.Mkdir("/data/newdir", 0755)
+		if err != nil {
+			t.Errorf("Mkdir() error = %v", err)
+		}
+		if backend.lastOp != "Mkdir" {
+			t.Errorf("lastOp = %v, want Mkdir", backend.lastOp)
+		}
+		if backend.lastPath != "/data/newdir" {
+			t.Errorf("lastPath = %v, want /data/newdir", backend.lastPath)
+		}
+		if backend.lastMode != 0755 {
+			t.Errorf("lastMode = %v, want 0755", backend.lastMode)
+		}
+	})
+
+	t.Run("mkdir with no route", func(t *testing.T) {
+		err := fs.Mkdir("/unrouted/dir", 0755)
+		if err != ErrNoRoute {
+			t.Errorf("Mkdir() error = %v, want ErrNoRoute", err)
+		}
+	})
+
+	t.Run("mkdir with backend error", func(t *testing.T) {
+		backend.returnErr = os.ErrExist
+		err := fs.Mkdir("/data/exists", 0755)
+		if err != os.ErrExist {
+			t.Errorf("Mkdir() error = %v, want ErrExist", err)
+		}
+		backend.returnErr = nil
+	})
+}
+
+func TestSwitchFS_MkdirAll(t *testing.T) {
+	backend := &trackingMockFS{name: "test"}
+
+	fs, err := New(
+		WithRoute("/data", backend, WithPriority(100)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	t.Run("successful mkdirall", func(t *testing.T) {
+		err := fs.MkdirAll("/data/deep/nested/dir", 0755)
+		if err != nil {
+			t.Errorf("MkdirAll() error = %v", err)
+		}
+		if backend.lastOp != "MkdirAll" {
+			t.Errorf("lastOp = %v, want MkdirAll", backend.lastOp)
+		}
+		if backend.lastPath != "/data/deep/nested/dir" {
+			t.Errorf("lastPath = %v, want /data/deep/nested/dir", backend.lastPath)
+		}
+	})
+
+	t.Run("mkdirall with no route", func(t *testing.T) {
+		err := fs.MkdirAll("/unrouted/dir", 0755)
+		if err != ErrNoRoute {
+			t.Errorf("MkdirAll() error = %v, want ErrNoRoute", err)
+		}
+	})
+
+	t.Run("mkdirall with backend error", func(t *testing.T) {
+		backend.returnErr = os.ErrPermission
+		err := fs.MkdirAll("/data/noperm", 0755)
+		if err != os.ErrPermission {
+			t.Errorf("MkdirAll() error = %v, want ErrPermission", err)
+		}
+		backend.returnErr = nil
+	})
+}
+
+func TestSwitchFS_Remove(t *testing.T) {
+	backend := &trackingMockFS{name: "test"}
+
+	fs, err := New(
+		WithRoute("/data", backend, WithPriority(100)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	t.Run("successful remove", func(t *testing.T) {
+		err := fs.Remove("/data/file.txt")
+		if err != nil {
+			t.Errorf("Remove() error = %v", err)
+		}
+		if backend.lastOp != "Remove" {
+			t.Errorf("lastOp = %v, want Remove", backend.lastOp)
+		}
+		if backend.lastPath != "/data/file.txt" {
+			t.Errorf("lastPath = %v, want /data/file.txt", backend.lastPath)
+		}
+	})
+
+	t.Run("remove with no route", func(t *testing.T) {
+		err := fs.Remove("/unrouted/file.txt")
+		if err != ErrNoRoute {
+			t.Errorf("Remove() error = %v, want ErrNoRoute", err)
+		}
+	})
+
+	t.Run("remove with backend error", func(t *testing.T) {
+		backend.returnErr = os.ErrNotExist
+		err := fs.Remove("/data/notexist.txt")
+		if err != os.ErrNotExist {
+			t.Errorf("Remove() error = %v, want ErrNotExist", err)
+		}
+		backend.returnErr = nil
+	})
+}
+
+func TestSwitchFS_RemoveAll(t *testing.T) {
+	backend := &trackingMockFS{name: "test"}
+
+	fs, err := New(
+		WithRoute("/data", backend, WithPriority(100)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	t.Run("successful removeall", func(t *testing.T) {
+		err := fs.RemoveAll("/data/directory")
+		if err != nil {
+			t.Errorf("RemoveAll() error = %v", err)
+		}
+		if backend.lastOp != "RemoveAll" {
+			t.Errorf("lastOp = %v, want RemoveAll", backend.lastOp)
+		}
+		if backend.lastPath != "/data/directory" {
+			t.Errorf("lastPath = %v, want /data/directory", backend.lastPath)
+		}
+	})
+
+	t.Run("removeall with no route", func(t *testing.T) {
+		err := fs.RemoveAll("/unrouted/dir")
+		if err != ErrNoRoute {
+			t.Errorf("RemoveAll() error = %v, want ErrNoRoute", err)
+		}
+	})
+
+	t.Run("removeall with backend error", func(t *testing.T) {
+		backend.returnErr = os.ErrPermission
+		err := fs.RemoveAll("/data/noperm")
+		if err != os.ErrPermission {
+			t.Errorf("RemoveAll() error = %v, want ErrPermission", err)
+		}
+		backend.returnErr = nil
+	})
+}
+
+func TestSwitchFS_Stat(t *testing.T) {
+	backend := &trackingMockFS{name: "test"}
+
+	fs, err := New(
+		WithRoute("/data", backend, WithPriority(100)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	t.Run("successful stat", func(t *testing.T) {
+		mockInfo := &statMockFileInfo{name: "test.txt", size: 100}
+		backend.returnFileInfo = mockInfo
+
+		info, err := fs.Stat("/data/test.txt")
+		if err != nil {
+			t.Errorf("Stat() error = %v", err)
+		}
+		if backend.lastOp != "Stat" {
+			t.Errorf("lastOp = %v, want Stat", backend.lastOp)
+		}
+		if backend.lastPath != "/data/test.txt" {
+			t.Errorf("lastPath = %v, want /data/test.txt", backend.lastPath)
+		}
+		if info != mockInfo {
+			t.Errorf("Stat() returned wrong FileInfo")
+		}
+	})
+
+	t.Run("stat with no route", func(t *testing.T) {
+		_, err := fs.Stat("/unrouted/file.txt")
+		if err != ErrNoRoute {
+			t.Errorf("Stat() error = %v, want ErrNoRoute", err)
+		}
+	})
+
+	t.Run("stat with backend error", func(t *testing.T) {
+		backend.returnErr = os.ErrNotExist
+		backend.returnFileInfo = nil
+		_, err := fs.Stat("/data/notexist.txt")
+		if err != os.ErrNotExist {
+			t.Errorf("Stat() error = %v, want ErrNotExist", err)
+		}
+		backend.returnErr = nil
+	})
+}
+
+func TestSwitchFS_Chmod(t *testing.T) {
+	backend := &trackingMockFS{name: "test"}
+
+	fs, err := New(
+		WithRoute("/data", backend, WithPriority(100)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	t.Run("successful chmod", func(t *testing.T) {
+		err := fs.Chmod("/data/file.txt", 0644)
+		if err != nil {
+			t.Errorf("Chmod() error = %v", err)
+		}
+		if backend.lastOp != "Chmod" {
+			t.Errorf("lastOp = %v, want Chmod", backend.lastOp)
+		}
+		if backend.lastPath != "/data/file.txt" {
+			t.Errorf("lastPath = %v, want /data/file.txt", backend.lastPath)
+		}
+		if backend.lastMode != 0644 {
+			t.Errorf("lastMode = %v, want 0644", backend.lastMode)
+		}
+	})
+
+	t.Run("chmod with no route", func(t *testing.T) {
+		err := fs.Chmod("/unrouted/file.txt", 0644)
+		if err != ErrNoRoute {
+			t.Errorf("Chmod() error = %v, want ErrNoRoute", err)
+		}
+	})
+
+	t.Run("chmod with backend error", func(t *testing.T) {
+		backend.returnErr = os.ErrPermission
+		err := fs.Chmod("/data/noperm.txt", 0644)
+		if err != os.ErrPermission {
+			t.Errorf("Chmod() error = %v, want ErrPermission", err)
+		}
+		backend.returnErr = nil
+	})
+}
+
+func TestSwitchFS_Chtimes(t *testing.T) {
+	backend := &trackingMockFS{name: "test"}
+
+	fs, err := New(
+		WithRoute("/data", backend, WithPriority(100)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	now := time.Now()
+	atime := now.Add(-1 * time.Hour)
+	mtime := now
+
+	t.Run("successful chtimes", func(t *testing.T) {
+		err := fs.Chtimes("/data/file.txt", atime, mtime)
+		if err != nil {
+			t.Errorf("Chtimes() error = %v", err)
+		}
+		if backend.lastOp != "Chtimes" {
+			t.Errorf("lastOp = %v, want Chtimes", backend.lastOp)
+		}
+		if backend.lastPath != "/data/file.txt" {
+			t.Errorf("lastPath = %v, want /data/file.txt", backend.lastPath)
+		}
+		if !backend.lastAtime.Equal(atime) {
+			t.Errorf("lastAtime = %v, want %v", backend.lastAtime, atime)
+		}
+		if !backend.lastMtime.Equal(mtime) {
+			t.Errorf("lastMtime = %v, want %v", backend.lastMtime, mtime)
+		}
+	})
+
+	t.Run("chtimes with no route", func(t *testing.T) {
+		err := fs.Chtimes("/unrouted/file.txt", atime, mtime)
+		if err != ErrNoRoute {
+			t.Errorf("Chtimes() error = %v, want ErrNoRoute", err)
+		}
+	})
+
+	t.Run("chtimes with backend error", func(t *testing.T) {
+		backend.returnErr = os.ErrNotExist
+		err := fs.Chtimes("/data/notexist.txt", atime, mtime)
+		if err != os.ErrNotExist {
+			t.Errorf("Chtimes() error = %v, want ErrNotExist", err)
+		}
+		backend.returnErr = nil
+	})
+}
+
+func TestSwitchFS_Chown(t *testing.T) {
+	backend := &trackingMockFS{name: "test"}
+
+	fs, err := New(
+		WithRoute("/data", backend, WithPriority(100)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	t.Run("successful chown", func(t *testing.T) {
+		err := fs.Chown("/data/file.txt", 1000, 1000)
+		if err != nil {
+			t.Errorf("Chown() error = %v", err)
+		}
+		if backend.lastOp != "Chown" {
+			t.Errorf("lastOp = %v, want Chown", backend.lastOp)
+		}
+		if backend.lastPath != "/data/file.txt" {
+			t.Errorf("lastPath = %v, want /data/file.txt", backend.lastPath)
+		}
+		if backend.lastUid != 1000 {
+			t.Errorf("lastUid = %v, want 1000", backend.lastUid)
+		}
+		if backend.lastGid != 1000 {
+			t.Errorf("lastGid = %v, want 1000", backend.lastGid)
+		}
+	})
+
+	t.Run("chown with no route", func(t *testing.T) {
+		err := fs.Chown("/unrouted/file.txt", 1000, 1000)
+		if err != ErrNoRoute {
+			t.Errorf("Chown() error = %v, want ErrNoRoute", err)
+		}
+	})
+
+	t.Run("chown with backend error", func(t *testing.T) {
+		backend.returnErr = os.ErrPermission
+		err := fs.Chown("/data/noperm.txt", 1000, 1000)
+		if err != os.ErrPermission {
+			t.Errorf("Chown() error = %v, want ErrPermission", err)
+		}
+		backend.returnErr = nil
+	})
+}
+
+func TestSwitchFS_Truncate(t *testing.T) {
+	backend := &trackingMockFS{name: "test"}
+
+	fs, err := New(
+		WithRoute("/data", backend, WithPriority(100)),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	t.Run("successful truncate", func(t *testing.T) {
+		err := fs.Truncate("/data/file.txt", 100)
+		if err != nil {
+			t.Errorf("Truncate() error = %v", err)
+		}
+		if backend.lastOp != "Truncate" {
+			t.Errorf("lastOp = %v, want Truncate", backend.lastOp)
+		}
+		if backend.lastPath != "/data/file.txt" {
+			t.Errorf("lastPath = %v, want /data/file.txt", backend.lastPath)
+		}
+		if backend.lastSize != 100 {
+			t.Errorf("lastSize = %v, want 100", backend.lastSize)
+		}
+	})
+
+	t.Run("truncate with no route", func(t *testing.T) {
+		err := fs.Truncate("/unrouted/file.txt", 100)
+		if err != ErrNoRoute {
+			t.Errorf("Truncate() error = %v, want ErrNoRoute", err)
+		}
+	})
+
+	t.Run("truncate with backend error", func(t *testing.T) {
+		backend.returnErr = os.ErrNotExist
+		err := fs.Truncate("/data/notexist.txt", 100)
+		if err != os.ErrNotExist {
+			t.Errorf("Truncate() error = %v, want ErrNotExist", err)
+		}
+		backend.returnErr = nil
+	})
+}
+
+func TestSwitchFS_ListSeparator(t *testing.T) {
+	t.Run("default list separator", func(t *testing.T) {
+		fs, err := New()
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		if got := fs.ListSeparator(); got != ':' {
+			t.Errorf("ListSeparator() = %v, want ':'", got)
+		}
+	})
+
+	t.Run("custom list separator", func(t *testing.T) {
+		fs, err := New(WithListSeparator(';'))
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		if got := fs.ListSeparator(); got != ';' {
+			t.Errorf("ListSeparator() = %v, want ';'", got)
+		}
+	})
+}
+
+func TestWithRouter(t *testing.T) {
+	t.Run("custom router", func(t *testing.T) {
+		customRouter := NewRouter()
+		backend := &mockFS{name: "test"}
+		customRouter.AddRoute(Route{
+			Pattern:  "/custom",
+			Backend:  backend,
+			Priority: 100,
+			Type:     PatternPrefix,
+		})
+
+		fs, err := New(WithRouter(customRouter))
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+
+		// Verify custom router is used
+		got, err := fs.getBackend("/custom/path")
+		if err != nil {
+			t.Fatalf("getBackend() error = %v", err)
+		}
+		if got != backend {
+			t.Errorf("getBackend() should use custom router")
+		}
+	})
+
+	t.Run("nil router returns error", func(t *testing.T) {
+		_, err := New(WithRouter(nil))
+		if err != ErrNilBackend {
+			t.Errorf("New(WithRouter(nil)) error = %v, want ErrNilBackend", err)
+		}
+	})
+}
+
+// statMockFileInfo for testing in this file
+type statMockFileInfo struct {
+	name    string
+	size    int64
+	mode    os.FileMode
+	modTime time.Time
+	isDir   bool
+}
+
+func (m *statMockFileInfo) Name() string       { return m.name }
+func (m *statMockFileInfo) Size() int64        { return m.size }
+func (m *statMockFileInfo) Mode() os.FileMode  { return m.mode }
+func (m *statMockFileInfo) ModTime() time.Time { return m.modTime }
+func (m *statMockFileInfo) IsDir() bool        { return m.isDir }
+func (m *statMockFileInfo) Sys() interface{}   { return nil }
