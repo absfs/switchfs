@@ -1,8 +1,12 @@
 github.com/absfs/absfs v0.0.0-20251109181304-77e2f9ac4448 h1:uN3Q47kmtV6TIGHZbrCbCf68jWmYDWyTcqq5JuoyON4=
 github.com/absfs/absfs v0.0.0-20251109181304-77e2f9ac4448/go.mod h1:IvFD36FQcMxLLZNhs2Lms+Uosc0G3AJ2JHOJIz8E5d8=
+github.com/absfs/fstesting v0.0.0-20251206231118-7a50ca2cce8a h1:XDf6hhmXiLj7WjXm0+6P5EM7TYV19cxFye0CJncyhzw=
+github.com/absfs/fstesting v0.0.0-20251206231118-7a50ca2cce8a/go.mod h1:k+GNl+VG/teXQBkCH5vt+gzPtkDCQTjX+hTgpDnnqEs=
 github.com/absfs/inode v0.0.0-20190804195220-b7cd14cdd0dc h1:KjciuTgBUzV6RfeVLd/Ijhy9Iq7z0JoJ44te3fZaaNE=
 github.com/absfs/inode v0.0.0-20190804195220-b7cd14cdd0dc/go.mod h1:lc9vQxyCSyrjclBTgazRvacmElJLj7VfpDmgDnL77o0=
 github.com/absfs/memfs v0.0.0-20251123003602-523f8650011b h1:q1E6lPBoKneLihl2gqseSXBPykF6y3zp4skq21uNA+E=
 github.com/absfs/memfs v0.0.0-20251123003602-523f8650011b/go.mod h1:ITY8mYr6yHK7ZTNblu5zQk33tMIRaJhoa+YX8/talDk=
+github.com/absfs/osfs v0.1.0-fastwalk h1:dEHAusiK/K8ROQgohL25q+cyqbiMXzSt1pgR3nbhNEg=
+github.com/absfs/osfs v0.1.0-fastwalk/go.mod h1:IIzwVILCbb3j0VHjcAQ7Xwpdz1h57eUzZil7DCIel/c=
 github.com/bmatcuk/doublestar/v4 v4.9.1 h1:X8jg9rRZmJd4yRy7ZeNDRnM+T3ZfHv15JiBJ/avrEXE=
 github.com/bmatcuk/doublestar/v4 v4.9.1/go.mod h1:xBQ8jztBU6kakFMg+8WGxn0c6z1fTSPVIjEY1Wr7jzc=
