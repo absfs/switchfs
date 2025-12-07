@@ -3,7 +3,7 @@ package switchfs
 import (
 	"io"
 	"os"
-	"path/filepath"
+	"path"
 	"time"
 
 	"github.com/absfs/absfs"
@@ -92,10 +92,10 @@ func (fs *SwitchFS) ListSeparator() uint8 {
 // Chdir changes the current working directory
 func (fs *SwitchFS) Chdir(dir string) error {
 	// Normalize the path
-	if !filepath.IsAbs(dir) {
-		dir = filepath.Join(fs.currentDir, dir)
+	if !path.IsAbs(dir) {
+		dir = path.Join(fs.currentDir, dir)
 	}
-	fs.currentDir = filepath.Clean(dir)
+	fs.currentDir = path.Clean(dir)
 	return nil
 }
 
@@ -260,8 +260,8 @@ func (fs *SwitchFS) crossBackendMoveDir(oldpath, newpath string, oldBackend, new
 			continue
 		}
 
-		srcPath := filepath.Join(oldpath, name)
-		dstPath := filepath.Join(newpath, name)
+		srcPath := path.Join(oldpath, name)
+		dstPath := path.Join(newpath, name)
 
 		if entry.IsDir() {
 			// Recursively copy subdirectory
