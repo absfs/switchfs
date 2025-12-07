@@ -1,5 +1,10 @@
 # switchfs
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/absfs/switchfs.svg)](https://pkg.go.dev/github.com/absfs/switchfs)
+[![Go Report Card](https://goreportcard.com/badge/github.com/absfs/switchfs)](https://goreportcard.com/report/github.com/absfs/switchfs)
+[![CI](https://github.com/absfs/switchfs/actions/workflows/ci.yml/badge.svg)](https://github.com/absfs/switchfs/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Path-based routing filesystem for the AbsFs ecosystem. Route filesystem operations to different backend implementations based on path patterns.
 
 ## Overview
