@@ -53,8 +53,9 @@ type globMatcher struct {
 }
 
 func (m *globMatcher) Match(path string) bool {
-	// Clean the path to normalize separators
-	path = filepath.Clean(path)
+	// Clean the path to normalize separators, then convert to forward slashes
+	// This ensures consistent matching across platforms (Windows uses backslashes)
+	path = filepath.ToSlash(filepath.Clean(path))
 
 	// Use doublestar for glob matching (supports ** and other patterns)
 	matched, err := doublestar.Match(m.pattern, path)
