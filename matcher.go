@@ -19,9 +19,10 @@ type prefixMatcher struct {
 }
 
 func (m *prefixMatcher) Match(path string) bool {
-	// Clean the path to normalize separators
-	path = filepath.Clean(path)
-	prefix := filepath.Clean(m.prefix)
+	// Clean the path to normalize separators, then convert to forward slashes
+	// This ensures consistent matching across platforms (Windows uses backslashes)
+	path = filepath.ToSlash(filepath.Clean(path))
+	prefix := filepath.ToSlash(filepath.Clean(m.prefix))
 
 	// Normalize both to have consistent slash handling
 	normPath := path
