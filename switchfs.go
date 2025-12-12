@@ -2,6 +2,7 @@ package switchfs
 
 import (
 	"io"
+	"io/fs"
 	"os"
 	"path"
 	"time"
@@ -14,8 +15,6 @@ type SwitchFS struct {
 	router     Router
 	defaultFS  absfs.FileSystem
 	currentDir string
-	separator  uint8
-	listSep    uint8
 	tempDir    string
 }
 
@@ -25,11 +24,9 @@ var _ absfs.FileSystem = (*SwitchFS)(nil)
 // New creates a new SwitchFS with the given options
 func New(opts ...Option) (*SwitchFS, error) {
 	fs := &SwitchFS{
-		router:      NewRouter(),
-		currentDir:  "/",
-		separator:   '/',
-		listSep:     ':',
-		tempDir:     "/tmp",
+		router:     NewRouter(),
+		currentDir: "/",
+		tempDir:    "/tmp",
 	}
 
 	for _, opt := range opts {
@@ -37,6 +34,9 @@ func New(opts ...Option) (*SwitchFS, error) {
 			return nil, err
 		}
 	}
+
+	// Note: separator fields removed in absfs 1.0
+	// All absfs filesystems use Unix-style '/' separator
 
 	return fs, nil
 }
@@ -77,16 +77,6 @@ func (fs *SwitchFS) getBackendAndRewrite(path string, info os.FileInfo) (absfs.F
 	}
 
 	return route.Backend, rewrittenPath, nil
-}
-
-// Separator returns the path separator
-func (fs *SwitchFS) Separator() uint8 {
-	return fs.separator
-}
-
-// ListSeparator returns the list separator
-func (fs *SwitchFS) ListSeparator() uint8 {
-	return fs.listSep
 }
 
 // Chdir changes the current working directory
@@ -328,4 +318,31 @@ func (fs *SwitchFS) Truncate(name string, size int64) error {
 // Router returns the underlying router for advanced usage
 func (fs *SwitchFS) Router() Router {
 	return fs.router
+}
+
+// ReadDir reads the named directory and returns a list of directory entries
+func (fs *SwitchFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	backend, err := fs.getBackend(name)
+	if err != nil {
+		return nil, err
+	}
+	return backend.ReadDir(name)
+}
+
+// ReadFile reads the named file and returns its contents
+func (fs *SwitchFS) ReadFile(name string) ([]byte, error) {
+	backend, err := fs.getBackend(name)
+	if err != nil {
+		return nil, err
+	}
+	return backend.ReadFile(name)
+}
+
+// Sub returns a Filer corresponding to the subtree rooted at dir
+func (fs *SwitchFS) Sub(dir string) (fs.FS, error) {
+	backend, err := fs.getBackend(dir)
+	if err != nil {
+		return nil, err
+	}
+	return absfs.FilerToFS(backend, dir)
 }

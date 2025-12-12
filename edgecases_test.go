@@ -418,8 +418,8 @@ func TestMultipleRoutesWithDifferentPatternTypes(t *testing.T) {
 	backend3 := &mockFS{name: "regex"}
 
 	fs, err := New(
-		WithRoute("/data", backend1, WithPriority(100)),                                  // prefix
-		WithRoute("*.log", backend2, WithPriority(90), WithPatternType(PatternGlob)),     // glob
+		WithRoute("/data", backend1, WithPriority(100)),                                     // prefix
+		WithRoute("*.log", backend2, WithPriority(90), WithPatternType(PatternGlob)),        // glob
 		WithRoute(`^/api/v\d+/`, backend3, WithPriority(80), WithPatternType(PatternRegex)), // regex
 	)
 	if err != nil {
@@ -640,16 +640,16 @@ type mockFile struct {
 	pos     int64
 }
 
-func (f *mockFile) Close() error                                 { return nil }
-func (f *mockFile) Read(p []byte) (n int, err error)             { return 0, io.EOF }
-func (f *mockFile) ReadAt(p []byte, off int64) (n int, err error) { return 0, io.EOF }
-func (f *mockFile) Seek(offset int64, whence int) (int64, error) { return 0, nil }
-func (f *mockFile) Write(p []byte) (n int, err error)            { return len(p), nil }
+func (f *mockFile) Close() error                                   { return nil }
+func (f *mockFile) Read(p []byte) (n int, err error)               { return 0, io.EOF }
+func (f *mockFile) ReadAt(p []byte, off int64) (n int, err error)  { return 0, io.EOF }
+func (f *mockFile) Seek(offset int64, whence int) (int64, error)   { return 0, nil }
+func (f *mockFile) Write(p []byte) (n int, err error)              { return len(p), nil }
 func (f *mockFile) WriteAt(p []byte, off int64) (n int, err error) { return len(p), nil }
-func (f *mockFile) Name() string                                 { return "mockfile" }
-func (f *mockFile) Readdir(count int) ([]os.FileInfo, error)     { return nil, nil }
-func (f *mockFile) Readdirnames(n int) ([]string, error)         { return nil, nil }
-func (f *mockFile) Stat() (os.FileInfo, error)                   { return nil, nil }
-func (f *mockFile) Sync() error                                  { return nil }
-func (f *mockFile) Truncate(size int64) error                    { return nil }
-func (f *mockFile) WriteString(s string) (ret int, err error)    { return len(s), nil }
+func (f *mockFile) Name() string                                   { return "mockfile" }
+func (f *mockFile) Readdir(count int) ([]os.FileInfo, error)       { return nil, nil }
+func (f *mockFile) Readdirnames(n int) ([]string, error)           { return nil, nil }
+func (f *mockFile) Stat() (os.FileInfo, error)                     { return nil, nil }
+func (f *mockFile) Sync() error                                    { return nil }
+func (f *mockFile) Truncate(size int64) error                      { return nil }
+func (f *mockFile) WriteString(s string) (ret int, err error)      { return len(s), nil }

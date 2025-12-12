@@ -1,6 +1,7 @@
 package switchfs
 
 import (
+	"io/fs"
 	"os"
 	"testing"
 	"time"
@@ -45,12 +46,16 @@ func (m *mockFS) Chown(name string, uid, gid int) error {
 	return nil
 }
 
-func (m *mockFS) Separator() uint8 {
-	return '/'
+func (m *mockFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	return nil, nil
 }
 
-func (m *mockFS) ListSeparator() uint8 {
-	return ':'
+func (m *mockFS) ReadFile(name string) ([]byte, error) {
+	return nil, nil
+}
+
+func (m *mockFS) Sub(dir string) (fs.FS, error) {
+	return absfs.FilerToFS(m, dir)
 }
 
 func (m *mockFS) Chdir(dir string) error {

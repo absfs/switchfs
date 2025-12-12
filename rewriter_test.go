@@ -370,9 +370,9 @@ func TestStaticMapping(t *testing.T) {
 		{
 			name: "multiple entry mapping",
 			mapping: map[string]string{
-				"/config":  "/etc/config",
-				"/data":    "/mnt/data",
-				"/logs":    "/var/log",
+				"/config": "/etc/config",
+				"/data":   "/mnt/data",
+				"/logs":   "/var/log",
 			},
 			path: "/data",
 			want: "/mnt/data",

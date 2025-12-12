@@ -83,22 +83,6 @@ func WithRewriter(rewriter PathRewriter) RouteOption {
 	}
 }
 
-// WithSeparator sets the path separator
-func WithSeparator(sep uint8) Option {
-	return func(fs *SwitchFS) error {
-		fs.separator = sep
-		return nil
-	}
-}
-
-// WithListSeparator sets the list separator
-func WithListSeparator(sep uint8) Option {
-	return func(fs *SwitchFS) error {
-		fs.listSep = sep
-		return nil
-	}
-}
-
 // WithTempDir sets the temporary directory path
 func WithTempDir(dir string) Option {
 	return func(fs *SwitchFS) error {

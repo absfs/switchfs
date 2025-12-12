@@ -1,6 +1,7 @@
 package switchfs
 
 import (
+	"io/fs"
 	"os"
 	"testing"
 	"time"
@@ -192,26 +193,8 @@ func TestSwitchFS_Chdir(t *testing.T) {
 	}
 }
 
-func TestSwitchFS_Separator(t *testing.T) {
-	fs, err := New()
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if got := fs.Separator(); got != '/' {
-		t.Errorf("Separator() = %v, want /", got)
-	}
-
-	// Test custom separator
-	fs2, err := New(WithSeparator('\\'))
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if got := fs2.Separator(); got != '\\' {
-		t.Errorf("Separator() = %v, want \\", got)
-	}
-}
+// TestSwitchFS_Separator removed - Separator() method removed in absfs 1.0
+// All absfs filesystems now use Unix-style paths with '/' separator
 
 func TestSwitchFS_TempDir(t *testing.T) {
 	fs, err := New()
@@ -334,10 +317,10 @@ func TestPatternType_String(t *testing.T) {
 
 // countingMockFS is a mock that counts operations
 type countingMockFS struct {
-	name         string
+	name          string
 	openFileCount int
-	mkdirCount   int
-	removeCount  int
+	mkdirCount    int
+	removeCount   int
 }
 
 func (m *countingMockFS) Open(name string) (absfs.File, error) {
@@ -382,12 +365,16 @@ func (m *countingMockFS) Chown(name string, uid, gid int) error {
 	return nil
 }
 
-func (m *countingMockFS) Separator() uint8 {
-	return '/'
+func (m *countingMockFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	return nil, nil
 }
 
-func (m *countingMockFS) ListSeparator() uint8 {
-	return ':'
+func (m *countingMockFS) ReadFile(name string) ([]byte, error) {
+	return nil, nil
+}
+
+func (m *countingMockFS) Sub(dir string) (fs.FS, error) {
+	return absfs.FilerToFS(m, dir)
 }
 
 func (m *countingMockFS) Chdir(dir string) error {
@@ -546,11 +533,30 @@ func (m *trackingMockFS) Truncate(name string, size int64) error {
 	return m.returnErr
 }
 
-func (m *trackingMockFS) Separator() uint8     { return '/' }
-func (m *trackingMockFS) ListSeparator() uint8 { return ':' }
+func (m *trackingMockFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	m.lastOp = "ReadDir"
+	m.lastPath = name
+	return nil, m.returnErr
+}
+
+func (m *trackingMockFS) ReadFile(name string) ([]byte, error) {
+	m.lastOp = "ReadFile"
+	m.lastPath = name
+	return nil, m.returnErr
+}
+
+func (m *trackingMockFS) Sub(dir string) (fs.FS, error) {
+	m.lastOp = "Sub"
+	m.lastPath = dir
+	if m.returnErr != nil {
+		return nil, m.returnErr
+	}
+	return absfs.FilerToFS(m, dir)
+}
+
 func (m *trackingMockFS) Chdir(dir string) error { return nil }
 func (m *trackingMockFS) Getwd() (string, error) { return "/", nil }
-func (m *trackingMockFS) TempDir() string { return "/tmp" }
+func (m *trackingMockFS) TempDir() string        { return "/tmp" }
 
 func TestSwitchFS_Mkdir(t *testing.T) {
 	backend := &trackingMockFS{name: "test"}
@@ -944,27 +950,8 @@ func TestSwitchFS_Truncate(t *testing.T) {
 	})
 }
 
-func TestSwitchFS_ListSeparator(t *testing.T) {
-	t.Run("default list separator", func(t *testing.T) {
-		fs, err := New()
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		if got := fs.ListSeparator(); got != ':' {
-			t.Errorf("ListSeparator() = %v, want ':'", got)
-		}
-	})
-
-	t.Run("custom list separator", func(t *testing.T) {
-		fs, err := New(WithListSeparator(';'))
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		if got := fs.ListSeparator(); got != ';' {
-			t.Errorf("ListSeparator() = %v, want ';'", got)
-		}
-	})
-}
+// TestSwitchFS_ListSeparator removed - ListSeparator() method removed in absfs 1.0
+// All absfs filesystems now use ':' as the list separator constant
 
 func TestWithRouter(t *testing.T) {
 	t.Run("custom router", func(t *testing.T) {
