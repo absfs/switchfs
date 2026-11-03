@@ -36,12 +36,9 @@ func (m *prefixMatcher) Match(path string) bool {
 		normPrefix = "/" + normPrefix
 	}
 
-	// Check if path starts with prefix
-	if strings.HasPrefix(normPath, normPrefix) {
-		return true
-	}
-
-	return false
+	// The prefix must end at a path component boundary: "/data" matches
+	// "/data" and "/data/x" but not "/database".
+	return normPrefix == "/" || normPath == normPrefix || strings.HasPrefix(normPath, normPrefix+"/")
 }
 
 func newPrefixMatcher(pattern string) (*prefixMatcher, error) {

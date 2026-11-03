@@ -8,22 +8,38 @@ import (
 	"github.com/absfs/absfs"
 )
 
-// Router manages routing decisions
+// Router manages routing decisions.
+//
+// The default implementation returned by NewRouter is safe for concurrent
+// use: routes may be added and removed while other goroutines route paths.
 type Router interface {
 	// AddRoute adds a routing rule
 	AddRoute(route Route) error
 
-	// RemoveRoute removes a routing rule by pattern
+	// RemoveRoute removes a routing rule by pattern. The default router
+	// removes the highest-priority route with that pattern, whatever its
+	// Type; use TypedRouteRemover (or SwitchFS.RemoveRoute) to name the
+	// type as well.
 	RemoveRoute(pattern string) error
 
-	// Route finds the backend for a given path
+	// Route finds the backend for a given path, ignoring route conditions
 	Route(path string) (absfs.FileSystem, error)
 
-	// RouteWithInfo finds the route for a given path with file info for condition evaluation
+	// RouteWithInfo finds the route for a given path with file info for
+	// condition evaluation. SwitchFS calls it for every operation, with a
+	// nil info.
 	RouteWithInfo(path string, info os.FileInfo) (*Route, error)
 
 	// Routes returns all registered routes
 	Routes() []Route
+}
+
+// TypedRouteRemover is implemented by routers that can remove a route by its
+// pattern and its pattern type together. The default router implements it.
+type TypedRouteRemover interface {
+	// RemoveRouteOfType removes the route whose Pattern and Type both match,
+	// returning ErrNoRoute when there is none.
+	RemoveRouteOfType(pattern string, typ PatternType) error
 }
 
 // router is the default implementation of Router
@@ -31,6 +47,8 @@ type router struct {
 	mu     sync.RWMutex
 	routes []Route
 }
+
+var _ TypedRouteRemover = (*router)(nil)
 
 // NewRouter creates a new router instance
 func NewRouter() Router {
@@ -62,28 +80,44 @@ func (r *router) AddRoute(route Route) error {
 		}
 	}
 
-	// Add the route
-	r.routes = append(r.routes, route)
+	// Build a new slice so routes handed out earlier are never mutated.
+	routes := make([]Route, len(r.routes), len(r.routes)+1)
+	copy(routes, r.routes)
+	routes = append(routes, route)
 
-	// Sort routes by priority (highest first)
-	sort.Slice(r.routes, func(i, j int) bool {
-		return r.routes[i].Priority > r.routes[j].Priority
+	// Sort routes by priority (highest first); equal priorities keep the
+	// order they were added in.
+	sort.SliceStable(routes, func(i, j int) bool {
+		return routes[i].Priority > routes[j].Priority
 	})
+	r.routes = routes
 
 	return nil
 }
 
-// RemoveRoute removes a routing rule by pattern
+// RemoveRoute removes the highest-priority routing rule with the pattern
 func (r *router) RemoveRoute(pattern string) error {
+	return r.remove(func(rt *Route) bool { return rt.Pattern == pattern })
+}
+
+// RemoveRouteOfType removes the routing rule with the pattern and type
+func (r *router) RemoveRouteOfType(pattern string, typ PatternType) error {
+	return r.remove(func(rt *Route) bool { return rt.Pattern == pattern && rt.Type == typ })
+}
+
+func (r *router) remove(match func(*Route) bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for i, route := range r.routes {
-		if route.Pattern == pattern {
-			// Remove the route
-			r.routes = append(r.routes[:i], r.routes[i+1:]...)
-			return nil
+	for i := range r.routes {
+		if !match(&r.routes[i]) {
+			continue
 		}
+		routes := make([]Route, 0, len(r.routes)-1)
+		routes = append(routes, r.routes[:i]...)
+		routes = append(routes, r.routes[i+1:]...)
+		r.routes = routes
+		return nil
 	}
 
 	return ErrNoRoute
@@ -104,7 +138,8 @@ func (r *router) Route(path string) (absfs.FileSystem, error) {
 	return nil, ErrNoRoute
 }
 
-// RouteWithInfo finds the route for a given path with file info for condition evaluation
+// RouteWithInfo finds the route for a given path with file info for
+// condition evaluation. The returned Route is a copy owned by the caller.
 func (r *router) RouteWithInfo(path string, info os.FileInfo) (*Route, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -123,7 +158,8 @@ func (r *router) RouteWithInfo(path string, info os.FileInfo) (*Route, error) {
 			continue
 		}
 
-		return route, nil
+		found := *route
+		return &found, nil
 	}
 
 	return nil, ErrNoRoute
