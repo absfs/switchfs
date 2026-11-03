@@ -15,29 +15,37 @@ func WithDefault(backend absfs.FileSystem) Option {
 	}
 }
 
-// WithRoute adds a routing rule
+// WithRoute adds a routing rule. The pattern is a prefix unless
+// WithPatternType says otherwise; priority defaults to 0.
 func WithRoute(pattern string, backend absfs.FileSystem, opts ...RouteOption) Option {
 	return func(fs *SwitchFS) error {
-		if backend == nil {
-			return ErrNilBackend
+		route, err := newRoute(pattern, backend, opts...)
+		if err != nil {
+			return err
 		}
-
-		route := Route{
-			Pattern:  pattern,
-			Backend:  backend,
-			Priority: 0,
-			Type:     PatternPrefix,
-		}
-
-		// Apply route options
-		for _, opt := range opts {
-			if err := opt(&route); err != nil {
-				return err
-			}
-		}
-
 		return fs.router.AddRoute(route)
 	}
+}
+
+// newRoute builds a prefix route with priority 0 and applies opts.
+func newRoute(pattern string, backend absfs.FileSystem, opts ...RouteOption) (Route, error) {
+	if backend == nil {
+		return Route{}, ErrNilBackend
+	}
+
+	route := Route{
+		Pattern:  pattern,
+		Backend:  backend,
+		Priority: 0,
+		Type:     PatternPrefix,
+	}
+
+	for _, opt := range opts {
+		if err := opt(&route); err != nil {
+			return Route{}, err
+		}
+	}
+	return route, nil
 }
 
 // WithPriority sets route priority

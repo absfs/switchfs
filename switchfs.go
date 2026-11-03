@@ -1,27 +1,40 @@
 package switchfs
 
 import (
-	"io"
 	"io/fs"
 	"os"
 	"path"
+	"reflect"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/absfs/absfs"
 )
 
-// SwitchFS implements absfs.FileSystem with routing
+// SwitchFS is an absfs.SymlinkFileSystem that routes every operation to a
+// backend filesystem chosen by the path. See the package documentation for
+// how paths are resolved, rewritten and reported back to callers.
+//
+// A SwitchFS is safe for concurrent use. Routes may be added and removed
+// while it is serving; each operation routes against the routes present
+// when it starts.
 type SwitchFS struct {
-	router     Router
-	defaultFS  absfs.FileSystem
+	router    Router
+	defaultFS absfs.FileSystem
+	tempDir   string
+
+	mu         sync.RWMutex // guards currentDir
 	currentDir string
-	tempDir    string
 }
 
-// Ensure SwitchFS implements absfs.FileSystem
-var _ absfs.FileSystem = (*SwitchFS)(nil)
+// Ensure SwitchFS implements absfs.FileSystem and absfs.SymlinkFileSystem.
+var (
+	_ absfs.FileSystem        = (*SwitchFS)(nil)
+	_ absfs.SymlinkFileSystem = (*SwitchFS)(nil)
+)
 
-// New creates a new SwitchFS with the given options
+// New creates a new SwitchFS with the given options.
 func New(opts ...Option) (*SwitchFS, error) {
 	fs := &SwitchFS{
 		router:     NewRouter(),
@@ -35,314 +48,315 @@ func New(opts ...Option) (*SwitchFS, error) {
 		}
 	}
 
-	// Note: separator fields removed in absfs 1.0
-	// All absfs filesystems use Unix-style '/' separator
-
 	return fs, nil
 }
 
-// getBackend finds the appropriate backend for a path
-func (fs *SwitchFS) getBackend(path string) (absfs.FileSystem, error) {
-	// Try to route the path
-	backend, err := fs.router.Route(path)
-	if err == ErrNoRoute {
-		// Use default backend if no route matches
-		if fs.defaultFS != nil {
-			return fs.defaultFS, nil
-		}
-		return nil, ErrNoRoute
+// abs resolves name against the working directory and cleans it, giving the
+// virtual path that is matched against the routes.
+func (fs *SwitchFS) abs(name string) string {
+	if path.IsAbs(name) {
+		return path.Clean(name)
 	}
+	fs.mu.RLock()
+	cwd := fs.currentDir
+	fs.mu.RUnlock()
+	return path.Join(cwd, name)
+}
+
+// getBackend finds the backend for a virtual path. It applies the same
+// routing as every operation but discards the rewritten path.
+func (fs *SwitchFS) getBackend(name string) (absfs.FileSystem, error) {
+	backend, _, err := fs.getBackendAndRewrite(name, nil)
 	return backend, err
 }
 
-// getBackendAndRewrite finds the backend and rewrites the path if needed
-func (fs *SwitchFS) getBackendAndRewrite(path string, info os.FileInfo) (absfs.FileSystem, string, error) {
-	// Try to route with file info for condition evaluation
-	route, err := fs.router.RouteWithInfo(path, info)
+// getBackendAndRewrite finds the backend for a virtual path and the path to
+// hand that backend. The route's Rewriter, if any, is applied, and a rewrite
+// that yields "" becomes "/". Paths that match no route go unchanged to the
+// default backend, or fail with ErrNoRoute when there is none.
+func (fs *SwitchFS) getBackendAndRewrite(name string, info os.FileInfo) (absfs.FileSystem, string, error) {
+	route, err := fs.router.RouteWithInfo(name, info)
 	if err == ErrNoRoute {
-		// Use default backend if no route matches
 		if fs.defaultFS != nil {
-			return fs.defaultFS, path, nil
+			return fs.defaultFS, name, nil
 		}
-		return nil, path, ErrNoRoute
+		return nil, name, ErrNoRoute
 	}
 	if err != nil {
-		return nil, path, err
+		return nil, name, err
 	}
 
-	// Apply path rewriter if present
-	rewrittenPath := path
+	rewritten := name
 	if route.Rewriter != nil {
-		rewrittenPath = route.Rewriter.Rewrite(path)
+		rewritten = route.Rewriter.Rewrite(name)
+		if rewritten == "" {
+			rewritten = "/"
+		}
 	}
 
-	return route.Backend, rewrittenPath, nil
+	return route.Backend, rewritten, nil
 }
 
-// Chdir changes the current working directory
-func (fs *SwitchFS) Chdir(dir string) error {
-	// Normalize the path
-	if !path.IsAbs(dir) {
-		dir = path.Join(fs.currentDir, dir)
+// resolve turns a caller's name into a backend and a backend path.
+func (fs *SwitchFS) resolve(name string) (absfs.FileSystem, string, error) {
+	return fs.getBackendAndRewrite(fs.abs(name), nil)
+}
+
+// sameBackend reports whether a and b are the same filesystem. Backends whose
+// dynamic type isn't comparable are never considered the same.
+func sameBackend(a, b absfs.FileSystem) bool {
+	if a == nil || b == nil {
+		return false
 	}
-	fs.currentDir = path.Clean(dir)
+	ta, tb := reflect.TypeOf(a), reflect.TypeOf(b)
+	if ta != tb || !ta.Comparable() {
+		return false
+	}
+	return a == b
+}
+
+// Chdir changes the working directory used to resolve relative paths. The
+// directory is resolved, routed and checked like any other path: it must
+// exist and be a directory. The working directory is virtual; backends'
+// own working directories are never changed.
+func (fs *SwitchFS) Chdir(dir string) error {
+	v := fs.abs(dir)
+	backend, p, err := fs.getBackendAndRewrite(v, nil)
+	if err != nil {
+		return err
+	}
+	info, err := backend.Stat(p)
+	if err != nil {
+		if pe, ok := err.(*os.PathError); ok {
+			return &os.PathError{Op: "chdir", Path: dir, Err: pe.Err}
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return &os.PathError{Op: "chdir", Path: dir, Err: syscall.ENOTDIR}
+	}
+
+	fs.mu.Lock()
+	fs.currentDir = v
+	fs.mu.Unlock()
 	return nil
 }
 
-// Getwd returns the current working directory
+// Getwd returns the virtual working directory.
 func (fs *SwitchFS) Getwd() (string, error) {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
 	return fs.currentDir, nil
 }
 
-// TempDir returns the temporary directory
+// TempDir returns the virtual temporary directory (default "/tmp", see
+// WithTempDir). It is routed like any other path.
 func (fs *SwitchFS) TempDir() string {
 	return fs.tempDir
 }
 
-// OpenFile opens a file with the specified flags and permissions
+// OpenFile opens a file with the specified flags and permissions. The
+// returned file's Name is the name passed in, not the backend path.
 func (fs *SwitchFS) OpenFile(name string, flag int, perm os.FileMode) (absfs.File, error) {
-	backend, err := fs.getBackend(name)
+	backend, p, err := fs.resolve(name)
 	if err != nil {
 		return nil, err
 	}
-	return backend.OpenFile(name, flag, perm)
+	f, err := backend.OpenFile(p, flag, perm)
+	if err != nil {
+		return nil, pathError(err, name)
+	}
+	return wrapFile(f, name, fs.abs(name)), nil
 }
 
-// Open opens a file for reading
+// Open opens a file for reading.
 func (fs *SwitchFS) Open(name string) (absfs.File, error) {
 	return fs.OpenFile(name, os.O_RDONLY, 0)
 }
 
-// Create creates a new file
+// Create creates or truncates a file for reading and writing.
 func (fs *SwitchFS) Create(name string) (absfs.File, error) {
 	return fs.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 }
 
-// Mkdir creates a directory
+// Mkdir creates a directory.
 func (fs *SwitchFS) Mkdir(name string, perm os.FileMode) error {
-	backend, err := fs.getBackend(name)
+	backend, p, err := fs.resolve(name)
 	if err != nil {
 		return err
 	}
-	return backend.Mkdir(name, perm)
+	return pathError(backend.Mkdir(p, perm), name)
 }
 
-// MkdirAll creates a directory and all parent directories
+// MkdirAll creates a directory and any missing parents. Parents are created
+// in the backend the full path routes to, under its rewritten path.
 func (fs *SwitchFS) MkdirAll(name string, perm os.FileMode) error {
-	backend, err := fs.getBackend(name)
+	backend, p, err := fs.resolve(name)
 	if err != nil {
 		return err
 	}
-	return backend.MkdirAll(name, perm)
+	return pathError(backend.MkdirAll(p, perm), name)
 }
 
-// Remove removes a file or empty directory
+// Remove removes a file or empty directory.
 func (fs *SwitchFS) Remove(name string) error {
-	backend, err := fs.getBackend(name)
+	backend, p, err := fs.resolve(name)
 	if err != nil {
 		return err
 	}
-	return backend.Remove(name)
+	return pathError(backend.Remove(p), name)
 }
 
-// RemoveAll removes a path and all children
-func (fs *SwitchFS) RemoveAll(path string) error {
-	backend, err := fs.getBackend(path)
+// RemoveAll removes a path and any children it contains, in the backend the
+// path routes to. Removing a route's own root (for example "/ws" routed with
+// StripPrefix("/ws")) removes the backend root's contents, as the backend
+// does for RemoveAll("/").
+func (fs *SwitchFS) RemoveAll(name string) error {
+	backend, p, err := fs.resolve(name)
 	if err != nil {
 		return err
 	}
-	return backend.RemoveAll(path)
+	return pathError(backend.RemoveAll(p), name)
 }
 
-// Rename renames (moves) oldpath to newpath
+// Rename renames (moves) oldpath to newpath. When both paths route to the
+// same backend the backend's own Rename is used with both rewritten paths;
+// otherwise the tree is copied to the new backend and removed from the old
+// one, which is not atomic. Errors are *os.LinkError values carrying the
+// caller's paths.
 func (fs *SwitchFS) Rename(oldpath, newpath string) error {
-	oldBackend, err := fs.getBackend(oldpath)
+	oldBackend, op, err := fs.resolve(oldpath)
+	if err != nil {
+		return err
+	}
+	newBackend, np, err := fs.resolve(newpath)
 	if err != nil {
 		return err
 	}
 
-	newBackend, err := fs.getBackend(newpath)
-	if err != nil {
-		return err
+	if sameBackend(oldBackend, newBackend) {
+		return linkError(oldBackend.Rename(op, np), "rename", oldpath, newpath)
 	}
-
-	// If both paths are on the same backend, use native rename
-	if oldBackend == newBackend {
-		return oldBackend.Rename(oldpath, newpath)
-	}
-
-	// Cross-backend rename: copy then delete
-	return fs.crossBackendMove(oldpath, newpath, oldBackend, newBackend)
+	return linkError(crossBackendMove(op, np, oldBackend, newBackend), "rename", oldpath, newpath)
 }
 
-// crossBackendMove handles moving files and directories across different backends
-func (fs *SwitchFS) crossBackendMove(oldpath, newpath string, oldBackend, newBackend absfs.FileSystem) error {
-	// Get file info
-	info, err := oldBackend.Stat(oldpath)
-	if err != nil {
-		return err
-	}
-
-	// Handle directories recursively
-	if info.IsDir() {
-		return fs.crossBackendMoveDir(oldpath, newpath, oldBackend, newBackend, info)
-	}
-
-	// Handle regular files
-	return fs.crossBackendMoveFile(oldpath, newpath, oldBackend, newBackend)
-}
-
-// crossBackendMoveFile handles moving a single file across backends
-func (fs *SwitchFS) crossBackendMoveFile(oldpath, newpath string, oldBackend, newBackend absfs.FileSystem) error {
-	// Open source file
-	src, err := oldBackend.Open(oldpath)
-	if err != nil {
-		return err
-	}
-	defer src.Close()
-
-	// Create destination file
-	dst, err := newBackend.Create(newpath)
-	if err != nil {
-		return err
-	}
-	defer dst.Close()
-
-	// Copy data
-	if _, err := io.Copy(dst, src); err != nil {
-		return err
-	}
-
-	// Close destination to flush
-	if err := dst.Close(); err != nil {
-		return err
-	}
-
-	// Remove source
-	return oldBackend.Remove(oldpath)
-}
-
-// crossBackendMoveDir handles moving a directory recursively across backends
-func (fs *SwitchFS) crossBackendMoveDir(oldpath, newpath string, oldBackend, newBackend absfs.FileSystem, info os.FileInfo) error {
-	// Create destination directory with same permissions
-	if err := newBackend.MkdirAll(newpath, info.Mode()); err != nil {
-		return err
-	}
-
-	// Open source directory
-	dir, err := oldBackend.Open(oldpath)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-
-	// Read all directory entries
-	entries, err := dir.Readdir(-1)
-	if err != nil {
-		return err
-	}
-
-	// Copy each entry recursively
-	for _, entry := range entries {
-		// Skip "." and ".." entries to avoid infinite recursion
-		name := entry.Name()
-		if name == "." || name == ".." {
-			continue
-		}
-
-		srcPath := path.Join(oldpath, name)
-		dstPath := path.Join(newpath, name)
-
-		if entry.IsDir() {
-			// Recursively copy subdirectory
-			if err := fs.crossBackendMoveDir(srcPath, dstPath, oldBackend, newBackend, entry); err != nil {
-				return err
-			}
-		} else {
-			// Copy file
-			if err := fs.crossBackendMoveFile(srcPath, dstPath, oldBackend, newBackend); err != nil {
-				return err
-			}
-		}
-	}
-
-	// Remove source directory after successful copy
-	return oldBackend.RemoveAll(oldpath)
-}
-
-// Stat returns file information
+// Stat returns file information, following symlinks inside the backend.
 func (fs *SwitchFS) Stat(name string) (os.FileInfo, error) {
-	backend, err := fs.getBackend(name)
+	backend, p, err := fs.resolve(name)
 	if err != nil {
 		return nil, err
 	}
-	return backend.Stat(name)
+	info, err := backend.Stat(p)
+	if err != nil {
+		return nil, pathError(err, name)
+	}
+	return wrapInfo(info, fs.abs(name)), nil
 }
 
-// Chmod changes file permissions
+// Chmod changes file permissions.
 func (fs *SwitchFS) Chmod(name string, mode os.FileMode) error {
-	backend, err := fs.getBackend(name)
+	backend, p, err := fs.resolve(name)
 	if err != nil {
 		return err
 	}
-	return backend.Chmod(name, mode)
+	return pathError(backend.Chmod(p, mode), name)
 }
 
-// Chtimes changes file access and modification times
+// Chtimes changes file access and modification times.
 func (fs *SwitchFS) Chtimes(name string, atime time.Time, mtime time.Time) error {
-	backend, err := fs.getBackend(name)
+	backend, p, err := fs.resolve(name)
 	if err != nil {
 		return err
 	}
-	return backend.Chtimes(name, atime, mtime)
+	return pathError(backend.Chtimes(p, atime, mtime), name)
 }
 
-// Chown changes file owner and group
+// Chown changes file owner and group.
 func (fs *SwitchFS) Chown(name string, uid, gid int) error {
-	backend, err := fs.getBackend(name)
+	backend, p, err := fs.resolve(name)
 	if err != nil {
 		return err
 	}
-	return backend.Chown(name, uid, gid)
+	return pathError(backend.Chown(p, uid, gid), name)
 }
 
-// Truncate changes the size of a file
+// Truncate changes the size of a file.
 func (fs *SwitchFS) Truncate(name string, size int64) error {
-	backend, err := fs.getBackend(name)
+	backend, p, err := fs.resolve(name)
 	if err != nil {
 		return err
 	}
-	return backend.Truncate(name, size)
+	return pathError(backend.Truncate(p, size), name)
 }
 
-// Router returns the underlying router for advanced usage
+// Router returns the underlying router for advanced usage, such as adding
+// and removing routes while the filesystem is serving.
 func (fs *SwitchFS) Router() Router {
 	return fs.router
 }
 
-// ReadDir reads the named directory and returns a list of directory entries
+// ReadDir reads the named directory and returns its entries. Only the
+// backend the directory routes to is listed: routes below the directory are
+// not merged in (see the package documentation for listing route parents).
 func (fs *SwitchFS) ReadDir(name string) ([]fs.DirEntry, error) {
-	backend, err := fs.getBackend(name)
+	backend, p, err := fs.resolve(name)
 	if err != nil {
 		return nil, err
 	}
-	return backend.ReadDir(name)
+	entries, err := backend.ReadDir(p)
+	if err != nil {
+		return entries, pathError(err, name)
+	}
+	return entries, nil
 }
 
-// ReadFile reads the named file and returns its contents
+// ReadFile reads the named file and returns its contents.
 func (fs *SwitchFS) ReadFile(name string) ([]byte, error) {
-	backend, err := fs.getBackend(name)
+	backend, p, err := fs.resolve(name)
 	if err != nil {
 		return nil, err
 	}
-	return backend.ReadFile(name)
+	data, err := backend.ReadFile(p)
+	if err != nil {
+		return data, pathError(err, name)
+	}
+	return data, nil
 }
 
-// Sub returns a Filer corresponding to the subtree rooted at dir
+// Sub returns a read-only fs.FS rooted at dir. The subtree is served through
+// this SwitchFS, so paths below dir keep routing (and rewriting) even when
+// they cross into other routes.
 func (fs *SwitchFS) Sub(dir string) (fs.FS, error) {
-	backend, err := fs.getBackend(dir)
+	return absfs.FilerToFS(fs, fs.abs(dir))
+}
+
+// AddRoute adds a route while the filesystem is in use. It takes the same
+// options as WithRoute and is safe to call concurrently with any operation;
+// operations that start after it returns see the new route.
+func (fs *SwitchFS) AddRoute(pattern string, backend absfs.FileSystem, opts ...RouteOption) error {
+	route, err := newRoute(pattern, backend, opts...)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return absfs.FilerToFS(backend, dir)
+	return fs.router.AddRoute(route)
+}
+
+// RemoveRoute removes the route with the given pattern and pattern type
+// while the filesystem is in use. Unlike Router.RemoveRoute, which matches
+// the pattern alone, it leaves routes with the same pattern but another type
+// in place. Files already open through the removed route stay usable.
+//
+// With a custom Router that doesn't implement TypedRouteRemover, it checks
+// Routes for a matching (pattern, type) and then falls back to
+// Router.RemoveRoute(pattern).
+func (fs *SwitchFS) RemoveRoute(pattern string, typ PatternType) error {
+	if r, ok := fs.router.(TypedRouteRemover); ok {
+		return r.RemoveRouteOfType(pattern, typ)
+	}
+	for _, rt := range fs.router.Routes() {
+		if rt.Pattern == pattern && rt.Type == typ {
+			return fs.router.RemoveRoute(pattern)
+		}
+	}
+	return ErrNoRoute
 }

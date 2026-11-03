@@ -147,7 +147,14 @@ func TestSwitchFS_NoDefaultBackend(t *testing.T) {
 }
 
 func TestSwitchFS_Chdir(t *testing.T) {
-	fs, err := New()
+	backend := mustMemFS(t)
+	for _, d := range []string{"/home/user", "/subdir"} {
+		if err := backend.MkdirAll(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(t, backend, "/file.txt", "x")
+	fs, err := New(WithDefault(backend))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -169,6 +176,16 @@ func TestSwitchFS_Chdir(t *testing.T) {
 			dir:     "subdir",
 			want:    "/subdir",
 			wantErr: false,
+		},
+		{
+			name:    "missing directory",
+			dir:     "/missing",
+			wantErr: true,
+		},
+		{
+			name:    "not a directory",
+			dir:     "/file.txt",
+			wantErr: true,
 		},
 	}
 
