@@ -133,11 +133,14 @@ func (fs *SwitchFS) Chdir(dir string) error {
 	if err != nil {
 		return err
 	}
-	if err := fs.checkSlash("chdir", dir, backend, p); err != nil {
-		return err
-	}
 	info, err := backend.Stat(p)
 	if err != nil {
+		// Chdir needs a directory with or without a trailing slash, so
+		// the slash rule applies to every name: on Windows, os.Chdir
+		// reports a dangling symlink as not a directory.
+		if fs.lookupNotDir(classify(backend, p)) {
+			return &os.PathError{Op: "chdir", Path: dir, Err: fs.notDir()}
+		}
 		if pe, ok := err.(*os.PathError); ok {
 			return &os.PathError{Op: "chdir", Path: dir, Err: pe.Err}
 		}
@@ -261,9 +264,14 @@ func (fs *SwitchFS) RemoveAll(name string) error {
 	}
 	if hasTrailingSlash(name) {
 		// As os.RemoveAll does, try a plain Remove of the name, slash and
-		// all, first.
-		err := fs.remove(name, backend, p)
-		if err == nil || errors.Is(err, os.ErrNotExist) {
+		// all, first, and stop if it worked or found nothing to remove. A
+		// not-a-directory from the slash rule never counts as nothing, even
+		// where its errno would match fs.ErrNotExist.
+		target, err := fs.removalPath(name, backend, p)
+		if err == nil {
+			err = backend.Remove(target)
+		}
+		if err == nil || (err != fs.notDir() && errors.Is(err, os.ErrNotExist)) {
 			return nil
 		}
 		// Windows then Lstats the name, which fails on a non-directory;

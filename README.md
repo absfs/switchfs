@@ -236,17 +236,17 @@ itself, against the object the cleaned path names in its backend:
 Hosts disagree on the details, and SwitchFS does what `os` does on the host it
 runs on, whatever the backend:
 
-| With a trailing slash                      | Linux                                      | macOS                                          | Windows                    |
-| ------------------------------------------ | ------------------------------------------ | ---------------------------------------------- | -------------------------- |
-| not-a-directory error                      | `ENOTDIR`                                  | `ENOTDIR`                                      | `ERROR_DIRECTORY` (267)    |
-| `OpenFile` with `O_CREATE`                 | always `EISDIR`                            | `ENOENT` if missing                            | not-a-directory if missing |
-| `Mkdir`, `MkdirAll` on a file              | `EEXIST`                                   | `ENOTDIR`                                      | the backend's exists error |
-| `Remove`, `Rename` from a symlink to a dir | `ENOTDIR`                                  | act on the directory                           | act on the link            |
-| a dangling symlink                         | `ENOENT`; `ENOTDIR` for `Remove`, `Rename` | followed: `ENOENT`; `Mkdir` creates the target | not-a-directory            |
-| `Rename` onto a missing `new/`             | `ENOTDIR` unless the source is a directory | `ENOENT` unless the source is a directory      | slash ignored              |
-| `RemoveAll("file/")`                       | removes the file                           | removes the file                               | not-a-directory            |
-| `Readlink("dir/")`, `Readlink("link/")`    | `EINVAL`                                   | `EINVAL`                                       | reads the link             |
-| `Chown`, `Lchown`                          | checked                                    | checked                                        | not checked                |
+| With a trailing slash                      | Linux                                      | macOS                                          | Windows                            |
+| ------------------------------------------ | ------------------------------------------ | ---------------------------------------------- | ---------------------------------- |
+| not-a-directory error                      | `ENOTDIR`                                  | `ENOTDIR`                                      | `ERROR_DIRECTORY` (267)            |
+| `OpenFile` with `O_CREATE`                 | always `EISDIR`                            | `ENOENT` if missing                            | not-a-directory if missing         |
+| `Mkdir`, `MkdirAll` on a file              | `EEXIST`                                   | `ENOTDIR`                                      | the backend's exists error         |
+| `Remove`, `Rename` from a symlink to a dir | `ENOTDIR`                                  | act on the directory                           | act on the link                    |
+| a dangling symlink                         | `ENOENT`; `ENOTDIR` for `Remove`, `Rename` | followed: `ENOENT`; `Mkdir` creates the target | not-a-directory                    |
+| `Rename` onto a missing `new/`             | `ENOTDIR` unless the source is a directory | `ENOENT` unless the source is a directory      | slash ignored, except below a file |
+| `RemoveAll("file/")`                       | removes the file                           | removes the file                               | not-a-directory                    |
+| `Readlink("dir/")`, `Readlink("link/")`    | `EINVAL`                                   | `EINVAL`                                       | reads the link                     |
+| `Chown`, `Lchown`                          | checked                                    | checked                                        | not checked                        |
 
 On Windows the not-a-directory error is `syscall.Errno(267)`, which `os`
 returns there. `syscall.ENOTDIR` would be wrong on Windows: it is

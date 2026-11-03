@@ -238,14 +238,22 @@ func (fs *SwitchFS) removalPath(name string, b absfs.FileSystem, p string) (stri
 
 // renameDest returns the path a Rename onto newpath (dst in dstB) writes,
 // or the errno it fails with, for a source src in srcB. Windows ignores a
-// trailing slash on the destination. On Unix it requires the destination to
+// trailing slash on the destination unless its parent is a file. On Unix it requires the destination to
 // end up a directory: an existing non-directory is ENOTDIR, and a missing
 // destination for a non-directory source is ENOTDIR on Linux and ENOENT on
 // macOS, which also renames a directory onto the target of a dangling
 // symlink. A symlink to a directory is EEXIST, as os.Rename refuses any
 // destination that Lstat, which follows the slash, finds is a directory.
 func (fs *SwitchFS) renameDest(newpath string, srcB absfs.FileSystem, src string, dstB absfs.FileSystem, dst string) (string, error) {
-	if !hasTrailingSlash(newpath) || fs.slash == slashWindows {
+	if !hasTrailingSlash(newpath) {
+		return dst, nil
+	}
+	if fs.slash == slashWindows {
+		// The slash is ignored, except that below a file it makes the
+		// name not-a-directory (ERROR_INVALID_PARAMETER without it).
+		if parent, err := dstB.Stat(path.Dir(dst)); err == nil && !parent.IsDir() {
+			return "", fs.notDir()
+		}
 		return dst, nil
 	}
 	srcInfo, err := lstat(srcB, src)

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/absfs/absfs"
 	"github.com/absfs/osfs"
 )
 
@@ -79,9 +80,10 @@ func (d osDir) Chdir(n string) error {
 	return os.Chdir(d.p(n))
 }
 
-// sfsDir is a SwitchFS, with names relative to a virtual directory.
+// sfsDir is an absfs filesystem (a SwitchFS, or osfs on its own), with
+// names relative to a directory in it.
 type sfsDir struct {
-	fs   *SwitchFS
+	fs   absfs.SymlinkFileSystem
 	root string
 }
 
@@ -111,7 +113,11 @@ func (d sfsDir) ReadFile(n string) ([]byte, error)         { return d.fs.ReadFil
 func (d sfsDir) Readlink(n string) (string, error)         { return d.fs.Readlink(d.p(n)) }
 func (d sfsDir) Symlink(target, n string) error            { return d.fs.Symlink(target, d.p(n)) }
 func (d sfsDir) Chdir(n string) error {
-	defer d.fs.Chdir("/")
+	wd, err := d.fs.Getwd()
+	if err != nil {
+		return err
+	}
+	defer d.fs.Chdir(wd)
 	return d.fs.Chdir(d.p(n))
 }
 
@@ -244,6 +250,13 @@ func errClass(err error) string {
 // type, errno, how the error tests against fs.ErrNotExist and fs.ErrExist,
 // what was found, and what was left on disk. The expected results come
 // from the host, so the test checks Linux, macOS and Windows rules on each.
+//
+// The one allowance is for osfs itself: where osfs, called directly and
+// without the slash, already disagrees with os, switchfs can only pass the
+// backend's answer on (osfs.ReadDir on Windows reads directories with
+// FindFirstFileEx and reports other errnos than os.ReadDir). Such a case is
+// skipped, with both results, only when switchfs gives exactly what osfs
+// gives without the slash.
 func TestTrailingSlash_MatchesHostOS(t *testing.T) {
 	host, err := osfs.NewFS()
 	if err != nil {
@@ -253,37 +266,26 @@ func TestTrailingSlash_MatchesHostOS(t *testing.T) {
 		for _, name := range slashNames {
 			op, name := op, name
 			t.Run(op.name+"/"+name, func(t *testing.T) {
-				osRoot := t.TempDir()
-				od := osDir{root: osRoot}
-				links := slashFixture(t, od, func(n, data string) {
-					if err := os.WriteFile(filepath.Join(osRoot, filepath.FromSlash(n)), []byte(data), 0644); err != nil {
-						t.Fatal(err)
-					}
-				})
-
-				sfsRoot, err := filepath.Abs(t.TempDir())
-				if err != nil {
-					t.Fatal(err)
-				}
-				sfs, err := New(
-					WithDefault(mustMemFS(t)),
-					WithRoute("/work", host, WithRewriter(ReplacePrefix("/work", osfs.FromNative(sfsRoot)))),
-				)
-				if err != nil {
-					t.Fatal(err)
-				}
-				sd := sfsDir{fs: sfs, root: "/work"}
-				slashFixture(t, sd, func(n, data string) { writeFile(t, sfs, sd.p(n), data) })
-
+				od, links := osFixture(t)
+				sd := hostFixture(t, host, true)
 				if !links && strings.HasPrefix(name, "l") {
 					t.Skip("host can't create symlinks")
 				}
 
 				osOut, osErr := op.run(od, name)
 				sfsOut, sfsErr := op.run(sd, name)
+				gotErr, wantErr := errClass(sfsErr), errClass(osErr)
 
-				if got, want := errClass(sfsErr), errClass(osErr); got != want {
-					t.Errorf("error: switchfs %s\n\t%v\nos %s\n\t%v", got, sfsErr, want, osErr)
+				if gotErr != wantErr {
+					plain := strings.TrimRight(name, "/")
+					_, backendErr := op.run(hostFixture(t, host, false), plain)
+					odPlain, _ := osFixture(t)
+					_, osPlainErr := op.run(odPlain, plain)
+					if errClass(backendErr) == gotErr && errClass(osPlainErr) != gotErr {
+						t.Skipf("osfs differs from os here: osfs %s (%v), os %s (%v) without the slash",
+							gotErr, backendErr, errClass(osPlainErr), osPlainErr)
+					}
+					t.Errorf("error: switchfs %s\n\t%v\nos %s\n\t%v", gotErr, sfsErr, wantErr, osErr)
 				}
 				if sfsOut != osOut {
 					t.Errorf("result: switchfs %q, os %q", sfsOut, osOut)
@@ -294,6 +296,43 @@ func TestTrailingSlash_MatchesHostOS(t *testing.T) {
 			})
 		}
 	}
+}
+
+// osFixture builds the fixture in a new host directory, for package os.
+func osFixture(t *testing.T) (osDir, bool) {
+	t.Helper()
+	root := t.TempDir()
+	d := osDir{root: root}
+	links := slashFixture(t, d, func(n, data string) {
+		if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(n)), []byte(data), 0644); err != nil {
+			t.Fatal(err)
+		}
+	})
+	return d, links
+}
+
+// hostFixture builds the fixture in a new host directory and returns it as
+// /work in a SwitchFS routing /work there through osfs, or, when switched
+// is false, as the directory in osfs itself.
+func hostFixture(t *testing.T, host *osfs.FileSystem, switched bool) sfsDir {
+	t.Helper()
+	root, err := filepath.Abs(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := sfsDir{fs: host, root: osfs.FromNative(root)}
+	if switched {
+		sfs, err := New(
+			WithDefault(mustMemFS(t)),
+			WithRoute("/work", host, WithRewriter(ReplacePrefix("/work", d.root))),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d = sfsDir{fs: sfs, root: "/work"}
+	}
+	slashFixture(t, d, func(n, data string) { writeFile(t, d.fs, d.p(n), data) })
+	return d
 }
 
 // slashSim runs op on name, with trailing-slash rules r, over a memfs
@@ -401,7 +440,7 @@ var slashRuleWant = map[slashRules]map[string]string{
 		"Readlink file/": "ENOTDIR", "Readlink lfile/": "ENOTDIR", "Readlink ldangle/": "ENOTDIR",
 		"Symlink file/": "ENOTDIR", "Symlink lfile/": "ENOTDIR", "Symlink missing/": "ENOTDIR", "Symlink ldangle/": "ENOTDIR",
 		"Chdir file/": "ENOTDIR", "Chdir lfile/": "ENOTDIR", "Chdir ldangle/": "ENOTDIR",
-		"MkdirAll ldangle/":  "EEXIST",
+		"MkdirAll ldangle/": "EEXIST", "RenameFileTo file/x/": "ENOTDIR", "RenameDirTo file/x/": "ENOTDIR",
 		"RemoveAll missing/": "ok", "RemoveAll nodir/x/": "ok", "RemoveAll file/x/": "ok",
 	},
 }
