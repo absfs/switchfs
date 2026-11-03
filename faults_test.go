@@ -3,6 +3,8 @@ package switchfs
 import (
 	"errors"
 	"os"
+	"sync/atomic"
+	"syscall"
 	"testing"
 
 	"github.com/absfs/absfs"
@@ -18,6 +20,10 @@ type faultFS struct {
 	closeFails bool
 	// readFails makes files opened for reading fail on Read.
 	readFails bool
+	// busyRemove makes Remove fail with EBUSY while any file opened from
+	// this filesystem is still open, as some hosts do.
+	busyRemove bool
+	open       atomic.Int64 // files opened and not yet closed
 }
 
 func newFaultFS(t *testing.T, ops ...string) *faultFS {
@@ -43,7 +49,47 @@ func (f *faultFS) Open(name string) (absfs.File, error) {
 	if err == nil && f.readFails {
 		return &errFile{name: name}, nil
 	}
-	return file, err
+	return f.track(file, err)
+}
+
+// track counts file as open until it is closed.
+func (f *faultFS) track(file absfs.File, err error) (absfs.File, error) {
+	if err != nil {
+		return file, err
+	}
+	f.open.Add(1)
+	return &trackedFile{File: file, owner: f}, nil
+}
+
+type trackedFile struct {
+	absfs.File
+	owner  *faultFS
+	closed bool
+}
+
+func (t *trackedFile) Close() error {
+	if !t.closed {
+		t.closed = true
+		t.owner.open.Add(-1)
+	}
+	return t.File.Close()
+}
+
+func (f *faultFS) Remove(name string) error {
+	if err := f.err("remove", name); err != nil {
+		return err
+	}
+	if f.busyRemove && f.open.Load() > 0 {
+		return &os.PathError{Op: "remove", Path: name, Err: syscall.EBUSY}
+	}
+	return f.SymlinkFileSystem.Remove(name)
+}
+
+func (f *faultFS) Lstat(name string) (os.FileInfo, error) {
+	if err := f.err("lstat", name); err != nil {
+		return nil, err
+	}
+	return f.SymlinkFileSystem.Lstat(name)
 }
 
 func (f *faultFS) OpenFile(name string, flag int, perm os.FileMode) (absfs.File, error) {
@@ -54,7 +100,7 @@ func (f *faultFS) OpenFile(name string, flag int, perm os.FileMode) (absfs.File,
 	if err == nil && f.closeFails {
 		return &closeFailFile{File: file}, nil
 	}
-	return file, err
+	return f.track(file, err)
 }
 
 func (f *faultFS) MkdirAll(name string, perm os.FileMode) error {

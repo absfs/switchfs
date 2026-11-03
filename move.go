@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"syscall"
 
 	"github.com/absfs/absfs"
 )
@@ -21,9 +22,17 @@ func lstat(b absfs.FileSystem, p string) (os.FileInfo, error) {
 // copying and then removing. Both paths are backend paths (already
 // rewritten). Symlinks are recreated, not followed; directories are moved
 // recursively. A failure part way leaves what was already moved in place.
+//
+// An existing newpath is treated as rename(2) treats it: a file or symlink
+// replaces any non-directory there (the old entry is removed first) and
+// fails with EISDIR on a directory; a directory may replace only an empty
+// directory, failing with ENOTEMPTY or ENOTDIR otherwise.
 func crossBackendMove(oldpath, newpath string, oldBackend, newBackend absfs.FileSystem) error {
 	info, err := lstat(oldBackend, oldpath)
 	if err != nil {
+		return err
+	}
+	if err := prepareDestination(newBackend, newpath, info.IsDir()); err != nil {
 		return err
 	}
 
@@ -35,6 +44,41 @@ func crossBackendMove(oldpath, newpath string, oldBackend, newBackend absfs.File
 	default:
 		return crossBackendMoveFile(oldpath, newpath, oldBackend, newBackend, info)
 	}
+}
+
+// prepareDestination makes room for a move to p in b, following rename(2).
+// Nothing at p is fine. For a non-directory source an existing directory is
+// EISDIR and anything else is removed; for a directory source an existing
+// non-directory is ENOTDIR and a non-empty directory is ENOTEMPTY.
+func prepareDestination(b absfs.FileSystem, p string, srcIsDir bool) error {
+	info, err := lstat(b, p)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	if !srcIsDir {
+		if info.IsDir() {
+			return &os.PathError{Op: "rename", Path: p, Err: syscall.EISDIR}
+		}
+		return b.Remove(p)
+	}
+
+	if !info.IsDir() {
+		return &os.PathError{Op: "rename", Path: p, Err: syscall.ENOTDIR}
+	}
+	entries, err := b.ReadDir(p)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if name := e.Name(); name != "." && name != ".." {
+			return &os.PathError{Op: "rename", Path: p, Err: syscall.ENOTEMPTY}
+		}
+	}
+	return nil
 }
 
 // crossBackendMoveSymlink recreates a symlink, with its target unchanged, in
@@ -97,6 +141,8 @@ func crossBackendMoveDir(oldpath, newpath string, oldBackend, newBackend absfs.F
 	}
 
 	for _, entry := range entries {
+		// Some backends list "." and ".."; following them would recurse
+		// into the same directory forever.
 		name := entry.Name()
 		if name == "." || name == ".." {
 			continue
