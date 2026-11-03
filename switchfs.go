@@ -368,19 +368,35 @@ func (fs *SwitchFS) AddRoute(pattern string, backend absfs.FileSystem, opts ...R
 // RemoveRoute removes the route with the given pattern and pattern type
 // while the filesystem is in use. Unlike Router.RemoveRoute, which matches
 // the pattern alone, it leaves routes with the same pattern but another type
-// in place. Files already open through the removed route stay usable.
+// in place. It returns ErrNoRoute when no route has both. Files already open
+// through the removed route stay usable.
 //
-// With a custom Router that doesn't implement TypedRouteRemover, it checks
-// Routes for a matching (pattern, type) and then falls back to
-// Router.RemoveRoute(pattern).
+// With a custom Router that doesn't implement TypedRouteRemover, it can only
+// call Router.RemoveRoute(pattern), which can't be told the type. It does so
+// when the (pattern, type) route is the only route with that pattern, and
+// returns ErrAmbiguousRoute, removing nothing, when routes of other types
+// share the pattern. The check and the removal are two router calls, so a
+// concurrent change to the same pattern between them can still race.
 func (fs *SwitchFS) RemoveRoute(pattern string, typ PatternType) error {
 	if r, ok := fs.router.(TypedRouteRemover); ok {
 		return r.RemoveRouteOfType(pattern, typ)
 	}
+	found, others := false, false
 	for _, rt := range fs.router.Routes() {
-		if rt.Pattern == pattern && rt.Type == typ {
-			return fs.router.RemoveRoute(pattern)
+		if rt.Pattern != pattern {
+			continue
+		}
+		if rt.Type == typ {
+			found = true
+		} else {
+			others = true
 		}
 	}
-	return ErrNoRoute
+	switch {
+	case !found:
+		return ErrNoRoute
+	case others:
+		return ErrAmbiguousRoute
+	}
+	return fs.router.RemoveRoute(pattern)
 }

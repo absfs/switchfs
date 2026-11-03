@@ -98,6 +98,18 @@ func TestDynamic_ConcurrentRouteChanges(t *testing.T) {
 		}
 	}
 
+	// A read-only workspace for the working directory to move into. Both
+	// it and the root hold an "f", so relative reads always find one.
+	writeFile(t, root, "/f", "root")
+	if err := root.Mkdir("/ro", 0755); err != nil {
+		t.Fatal(err)
+	}
+	ro := mustMemFS(t)
+	writeFile(t, ro, "/f", "ro")
+	if err := wsRoute(sfs, "ro", ro); err != nil {
+		t.Fatal(err)
+	}
+
 	// Churned workspaces: backends populated up front and only read after.
 	churnBackends := make([]absfs.FileSystem, churners)
 	for i := range churnBackends {
@@ -212,17 +224,45 @@ func TestDynamic_ConcurrentRouteChanges(t *testing.T) {
 				return
 			default:
 			}
-			if err := sfs.Chdir("/w0"); err != nil {
+			if err := sfs.Chdir("/ro"); err != nil {
 				fail("Chdir: %v", err)
-			}
-			if _, err := sfs.Getwd(); err != nil {
-				fail("Getwd: %v", err)
 			}
 			if err := sfs.Chdir("/"); err != nil {
 				fail("Chdir(/): %v", err)
 			}
 		}
 	}()
+
+	// Relative-path readers race the Chdir goroutine for the working
+	// directory: each operation sees "/" or "/ro", never anything else.
+	for r := 0; r < 2; r++ {
+		open.Add(1)
+		go func() {
+			defer open.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if wd, err := sfs.Getwd(); err != nil || (wd != "/" && wd != "/ro") {
+					fail("Getwd = %q, %v", wd, err)
+				}
+				data, err := sfs.ReadFile("f")
+				if err != nil || (string(data) != "root" && string(data) != "ro") {
+					fail("ReadFile(f) = %q, %v", data, err)
+				}
+				if _, err := sfs.Stat("f"); err != nil {
+					fail("Stat(f): %v", err)
+				}
+				if f, err := sfs.Open("./f"); err != nil {
+					fail("Open(./f): %v", err)
+				} else {
+					f.Close()
+				}
+			}
+		}()
+	}
 
 	// Once the workers and churners finish, stop the open-ended goroutines.
 	bounded.Wait()
@@ -232,9 +272,56 @@ func TestDynamic_ConcurrentRouteChanges(t *testing.T) {
 	if failures.Load() > 0 {
 		return
 	}
-	if routes := sfs.Router().Routes(); len(routes) != workers {
-		t.Fatalf("routes left = %d, want %d", len(routes), workers)
+	if routes := sfs.Router().Routes(); len(routes) != workers+1 {
+		t.Fatalf("routes left = %d, want %d", len(routes), workers+1)
 	}
+}
+
+// TestRouter_ConcurrentLookupAndChange hammers the default router directly:
+// lookups in one goroutine, adds and removes in another, in tight loops, so
+// the race detector sees the two overlap on every run.
+func TestRouter_ConcurrentLookupAndChange(t *testing.T) {
+	r := NewRouter()
+	m := mustMemFS(t)
+	if err := r.AddRoute(Route{Pattern: "/stable", Backend: m}); err != nil {
+		t.Fatal(err)
+	}
+	const n = 2000
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			if rt, err := r.RouteWithInfo("/stable/x", nil); err != nil || rt.Pattern != "/stable" {
+				t.Errorf("RouteWithInfo = %v, %v", rt, err)
+				return
+			}
+			_, _ = r.RouteWithInfo("/churn/x", nil)
+			_, _ = r.Route("/churn/x")
+			_ = r.Routes()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		tr := r.(TypedRouteRemover)
+		for i := 0; i < n; i++ {
+			if err := r.AddRoute(Route{Pattern: "/churn", Backend: m, Priority: i % 3}); err != nil {
+				t.Errorf("AddRoute: %v", err)
+				return
+			}
+			var err error
+			if i%2 == 0 {
+				err = r.RemoveRoute("/churn")
+			} else {
+				err = tr.RemoveRouteOfType("/churn", PatternPrefix)
+			}
+			if err != nil {
+				t.Errorf("remove: %v", err)
+				return
+			}
+		}
+	}()
+	wg.Wait()
 }
 
 func TestRemoveRoute_ByType(t *testing.T) {
@@ -304,6 +391,51 @@ func TestRemoveRoute_CustomRouterFallback(t *testing.T) {
 	}
 	if n := len(sfs.Router().Routes()); n != 0 {
 		t.Fatalf("routes left = %d", n)
+	}
+}
+
+// TestRemoveRoute_CustomRouterAmbiguous: with a router that can only remove
+// by pattern, RemoveRoute must not take a same-pattern route of another type.
+func TestRemoveRoute_CustomRouterAmbiguous(t *testing.T) {
+	sfs, err := New(WithRouter(&plainRouter{inner: NewRouter()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m1, m2 := mustMemFS(t), mustMemFS(t)
+	if err := sfs.AddRoute("/same", m1, WithPriority(10)); err != nil {
+		t.Fatal(err)
+	}
+	if err := sfs.AddRoute("/same", m2, WithPatternType(PatternRegex), WithPriority(5)); err != nil {
+		t.Fatal(err)
+	}
+	if err := sfs.AddRoute("/unrelated", m2, WithPatternType(PatternGlob)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Either type is ambiguous: removing by pattern could take the other.
+	for _, typ := range []PatternType{PatternRegex, PatternPrefix} {
+		if err := sfs.RemoveRoute("/same", typ); err != ErrAmbiguousRoute {
+			t.Fatalf("RemoveRoute(%v) = %v, want ErrAmbiguousRoute", typ, err)
+		}
+		if n := len(sfs.Router().Routes()); n != 3 {
+			t.Fatalf("routes after refused remove = %d, want 3", n)
+		}
+	}
+	// A type no route has is still ErrNoRoute.
+	if err := sfs.RemoveRoute("/same", PatternGlob); err != ErrNoRoute {
+		t.Fatalf("RemoveRoute(glob) = %v, want ErrNoRoute", err)
+	}
+
+	// Once the pattern is unambiguous again, the remove goes through and
+	// takes the route that was asked for.
+	if err := sfs.Router().RemoveRoute("/same"); err != nil { // the prefix route
+		t.Fatal(err)
+	}
+	if err := sfs.RemoveRoute("/same", PatternRegex); err != nil {
+		t.Fatal(err)
+	}
+	if routes := sfs.Router().Routes(); len(routes) != 1 || routes[0].Pattern != "/unrelated" {
+		t.Fatalf("routes left = %+v", routes)
 	}
 }
 
