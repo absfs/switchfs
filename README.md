@@ -391,6 +391,10 @@ one:
 - **Cross-backend renames are copies**, not atomic.
 - **`Route.Failover` / `WithFailover` are recorded but not used**; every
   operation goes to the route's `Backend`.
+- A file returned under a different name than its backend's (any file opened
+  through a rewriting route) is a wrapper exposing the `absfs.File` methods
+  only; optional interfaces of the backend's file type, such as `Fd()`, are
+  hidden.
 - `TempDir()` is the virtual path `/tmp` (or `WithTempDir`), routed like any
   other path.
 
