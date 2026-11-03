@@ -24,8 +24,11 @@ func (fs *SwitchFS) Lstat(name string) (os.FileInfo, error) {
 		return nil, err
 	}
 	var info os.FileInfo
-	if fs.slashed(name, backend, p) {
+	if hasTrailingSlash(name) {
 		// A trailing slash resolves a final symlink, so this is a Stat.
+		// It is even where Windows ignores the slash (below a symlinked
+		// directory): os.Lstat there follows a name ending in a separator
+		// itself.
 		if err := fs.checkSlash("lstat", name, backend, p); err != nil {
 			return nil, err
 		}

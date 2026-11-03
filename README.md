@@ -271,6 +271,17 @@ checks for not-a-directory portably should do what it would do with `os`
 the Linux rules; only Linux, macOS and Windows are compared against `os` in the
 tests.
 
+Two host quirks are worth knowing:
+
+- On Windows the slash is lost when a name is reparsed at a symlinked directory
+  above it, so `os` treats `linkdir/file/` as `linkdir/file`, and so does
+  SwitchFS. `Lstat` still follows a final link there, as `os.Lstat` on
+  Windows does for any name ending in a separator.
+- macOS 26 and earlier also lose the slash in one case: creating a file, a
+  symlink or a rename destination through a dangling symlink whose target has a
+  slash in it (`l -> ../new`) creates `../new`. macOS 27 fails with `ENOENT`,
+  as POSIX requires, and SwitchFS does the same on every macOS version.
+
 ## Changing routes while serving
 
 Routes can be added and removed at any time, from any goroutine:

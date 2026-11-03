@@ -47,10 +47,11 @@
 // are resolved as the kernel resolves them, through symlinked parent
 // directories before any ".." in a target. Where hosts differ (the errno,
 // OpenFile with O_CREATE, a symlink to a directory) SwitchFS does what os
-// does on the host it runs on, whatever the backend. On Windows the error is ERROR_DIRECTORY (267), as os
-// returns there, not syscall.ENOTDIR, which on Windows is
-// ERROR_PATH_NOT_FOUND and would match fs.ErrNotExist. See the README for
-// the full table.
+// does on the host it runs on, whatever the backend; on Windows that
+// includes ignoring the slash below a symlinked directory, as os does
+// there. On Windows the error is ERROR_DIRECTORY (267), as os returns
+// there, not syscall.ENOTDIR, which on Windows is ERROR_PATH_NOT_FOUND and
+// would match fs.ErrNotExist. See the README for the full table.
 //
 // # What callers see
 //

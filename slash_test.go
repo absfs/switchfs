@@ -319,6 +319,10 @@ func TestTrailingSlash_MatchesHostOS(t *testing.T) {
 				sfsOut, sfsErr := op.run(sd, name)
 				gotErr, wantErr := errClass(sfsErr), errClass(osErr)
 
+				if gotErr != wantErr && osErr == nil && errors.Is(sfsErr, syscall.ENOENT) && oldMacOSDropsSlash(op.name, name) {
+					t.Skipf("macOS %d drops the slash here and creates at the link's target; switchfs follows macOS 27: %v",
+						hostMajorVersion(), sfsErr)
+				}
 				if gotErr != wantErr {
 					plain := strings.TrimRight(name, "/")
 					_, backendErr := op.run(hostFixture(t, host, false), plain)
@@ -339,6 +343,22 @@ func TestTrailingSlash_MatchesHostOS(t *testing.T) {
 			})
 		}
 	}
+}
+
+// oldMacOSDropsSlash reports whether op on name is a case where macOS
+// before 27 loses the trailing slash: making a non-directory (a file, a
+// symlink, a rename destination) through a dangling symlink whose target
+// has a slash in it (r/sub/upd -> ../newdir) creates the target, where
+// macOS 27, like POSIX, fails with ENOENT. SwitchFS follows macOS 27.
+func oldMacOSDropsSlash(op, name string) bool {
+	if runtime.GOOS != "darwin" || hostMajorVersion() >= 27 {
+		return false
+	}
+	switch op {
+	case "Create", "CreateRO", "RenameFileTo", "Symlink":
+		return name == "pl/upd/" || name == "r/sub/upd/"
+	}
+	return false
 }
 
 // osFixture builds the fixture in a new host directory, for package os.
