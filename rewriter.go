@@ -26,7 +26,11 @@ func (r *prefixRewriter) Rewrite(path string) string {
 	return path
 }
 
-// StripPrefix creates a rewriter that removes a prefix from paths
+// StripPrefix creates a rewriter that removes a prefix from paths. Paths
+// without the prefix are returned unchanged. Used with a route on the same
+// prefix, it makes the backend see the route as its root: "/ws/a" becomes
+// "/a", and "/ws" becomes "" (which SwitchFS turns into "/"). Give the
+// prefix without a trailing slash.
 func StripPrefix(prefix string) PathRewriter {
 	return &prefixRewriter{oldPrefix: prefix, newPrefix: ""}
 }

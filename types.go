@@ -42,13 +42,17 @@ type Route struct {
 	// Type specifies how the pattern should be matched
 	Type PatternType
 
-	// Failover is an optional backup backend
+	// Failover is an optional backup backend. It is recorded but not yet
+	// used: operations go to Backend only.
 	Failover absfs.FileSystem
 
-	// Condition is an optional condition that must be met for routing
+	// Condition is an optional condition that must be met for routing.
+	// SwitchFS evaluates it with the path and a nil os.FileInfo.
 	Condition RouteCondition
 
-	// Rewriter optionally transforms paths before passing to backend
+	// Rewriter optionally transforms paths before passing to backend.
+	// SwitchFS applies it to every path-taking operation; a result of ""
+	// becomes "/".
 	Rewriter PathRewriter
 
 	// compiled stores the compiled pattern matcher

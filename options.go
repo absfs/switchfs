@@ -64,7 +64,8 @@ func WithPatternType(pt PatternType) RouteOption {
 	}
 }
 
-// WithFailover sets a failover backend
+// WithFailover sets a failover backend. It is recorded on the route but
+// not yet used by SwitchFS.
 func WithFailover(backend absfs.FileSystem) RouteOption {
 	return func(r *Route) error {
 		if backend == nil {
@@ -99,7 +100,8 @@ func WithTempDir(dir string) Option {
 	}
 }
 
-// WithRouter sets a custom router implementation
+// WithRouter sets a custom router implementation. A custom router should
+// be safe for concurrent use if routes change while the filesystem serves.
 func WithRouter(router Router) Option {
 	return func(fs *SwitchFS) error {
 		if router == nil {
