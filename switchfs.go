@@ -138,7 +138,7 @@ func (fs *SwitchFS) Chdir(dir string) error {
 		// Chdir needs a directory with or without a trailing slash, so
 		// the slash rule applies to every name: on Windows, os.Chdir
 		// reports a dangling symlink as not a directory.
-		if fs.lookupNotDir(classify(backend, p)) {
+		if k, _ := classify(backend, p); fs.lookupNotDir(k) {
 			return &os.PathError{Op: "chdir", Path: dir, Err: fs.notDir()}
 		}
 		if pe, ok := err.(*os.PathError); ok {
@@ -177,7 +177,7 @@ func (fs *SwitchFS) OpenFile(name string, flag int, perm os.FileMode) (absfs.Fil
 		return nil, err
 	}
 	if hasTrailingSlash(name) {
-		if err := fs.openSlash(backend, p, flag); err != nil {
+		if flag, err = fs.openSlash(backend, p, flag); err != nil {
 			return nil, &os.PathError{Op: "open", Path: name, Err: err}
 		}
 	}
@@ -215,8 +215,8 @@ func (fs *SwitchFS) MkdirAll(name string, perm os.FileMode) error {
 		return err
 	}
 	if hasTrailingSlash(name) {
-		switch classify(backend, p) {
-		case kindFile, kindLinkFile, kindLinkDangling:
+		switch k, _ := classify(backend, p); k {
+		case kindFile, kindLinkFile, kindLinkDangling, kindLinkErr:
 			// Something that isn't a directory is in the way: fail as
 			// Mkdir of the same name does.
 			return fs.mkdir(name, backend, p, perm)
@@ -276,7 +276,7 @@ func (fs *SwitchFS) RemoveAll(name string) error {
 		}
 		// Windows then Lstats the name, which fails on a non-directory;
 		// Unix removes it without the slash.
-		if fs.slash == slashWindows && fs.lookupNotDir(classify(backend, p)) {
+		if k, _ := classify(backend, p); fs.slash == slashWindows && fs.lookupNotDir(k) {
 			return &os.PathError{Op: "RemoveAll", Path: name, Err: fs.notDir()}
 		}
 	}
@@ -303,7 +303,17 @@ func (fs *SwitchFS) Rename(oldpath, newpath string) error {
 	if op, err = fs.removalPath(oldpath, oldBackend, op); err != nil {
 		return linkError(err, "rename", oldpath, newpath)
 	}
-	if np, err = fs.renameDest(newpath, oldBackend, op, newBackend, np); err != nil {
+	np, err = fs.renameDest(newpath, oldBackend, op, newBackend, np)
+	if err == errRenameSelf {
+		// rename(2) leaves a directory renamed onto itself alone, but
+		// os.Rename refuses an existing directory as the destination
+		// first unless the two names differ.
+		if oldpath == newpath {
+			return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: syscall.EEXIST}
+		}
+		return nil
+	}
+	if err != nil {
 		return linkError(err, "rename", oldpath, newpath)
 	}
 

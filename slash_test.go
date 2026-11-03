@@ -70,7 +70,9 @@ func (d osDir) Truncate(n string, size int64) error       { return os.Truncate(d
 func (d osDir) ReadDir(n string) ([]fs.DirEntry, error)   { return os.ReadDir(d.p(n)) }
 func (d osDir) ReadFile(n string) ([]byte, error)         { return os.ReadFile(d.p(n)) }
 func (d osDir) Readlink(n string) (string, error)         { return os.Readlink(d.p(n)) }
-func (d osDir) Symlink(target, n string) error            { return os.Symlink(target, d.p(n)) }
+func (d osDir) Symlink(target, n string) error {
+	return os.Symlink(filepath.FromSlash(target), d.p(n))
+}
 func (d osDir) Chdir(n string) error {
 	wd, err := os.Getwd()
 	if err != nil {
@@ -153,6 +155,9 @@ var slashOps = []slashOp{
 	{"CreateRO", func(d slashFS, n string) (string, error) {
 		return openResult(d.OpenFile(n, os.O_RDONLY|os.O_CREATE, 0644))
 	}},
+	{"OpenNofollow", func(d slashFS, n string) (string, error) {
+		return openResult(d.OpenFile(n, os.O_RDONLY|oNoFollow, 0))
+	}},
 	{"Mkdir", func(d slashFS, n string) (string, error) { return "", d.Mkdir(n, 0755) }},
 	{"MkdirAll", func(d slashFS, n string) (string, error) { return "", d.MkdirAll(n, 0755) }},
 	{"Remove", func(d slashFS, n string) (string, error) { return "", d.Remove(n) }},
@@ -160,6 +165,7 @@ var slashOps = []slashOp{
 	{"RenameFrom", func(d slashFS, n string) (string, error) { return "", d.Rename(n, "new") }},
 	{"RenameFileTo", func(d slashFS, n string) (string, error) { return "", d.Rename("file", n) }},
 	{"RenameDirTo", func(d slashFS, n string) (string, error) { return "", d.Rename("dir2", n) }},
+	{"RenameDirOnto", func(d slashFS, n string) (string, error) { return "", d.Rename("dir", n) }},
 	{"Chmod", func(d slashFS, n string) (string, error) { return "", d.Chmod(n, 0700) }},
 	{"Chtimes", func(d slashFS, n string) (string, error) {
 		return "", d.Chtimes(n, time.Unix(1e9, 0), time.Unix(1e9, 0))
@@ -182,35 +188,54 @@ var slashOps = []slashOp{
 
 // slashNames are the names each operation is called with: one of each kind
 // of object with a trailing slash, a slash after a missing parent and after
-// a file, and some controls without a slash.
+// a file, and some controls without a slash. The links cover a loop, chains
+// of links, and links reached through a symlinked parent whose targets
+// climb out with "..", which must resolve against the directory the parent
+// link leads to, as the kernel does, and not against the name.
 var slashNames = []string{
 	"file/", "dir/", "full/", "missing/", "lfile/", "ldir/", "ldangle/",
+	"lloop/", "lchain/", "lchainf/", "pl/up/", "pl/upd/",
 	"nodir/x/", "file/x/", "dir//",
-	"file", "dir", "missing", "ldir", "ldangle",
+	"file", "dir", "missing", "ldir", "ldangle", "lloop",
+}
+
+// slashLinked reports whether name involves a symlink, so needs a host that
+// can make them.
+func slashLinked(name string) bool {
+	return strings.HasPrefix(name, "l") || strings.HasPrefix(name, "pl/")
 }
 
 // slashTree lists every name the fixture has or an operation might create,
 // so the state after a call can be compared.
 var slashTree = []string{
 	"file", "dir", "dir2", "full", "full/child", "missing", "new", "nowhere",
-	"lfile", "ldir", "ldangle", "nodir", "dir/x", "dir2/x",
+	"lfile", "ldir", "ldangle", "lloop", "lchain", "lchainf", "nodir", "dir/x", "dir2/x",
+	"r", "r/sub", "r/target", "r/newdir", "target", "newdir", "pl", "r/sub/up", "r/sub/upd",
 }
 
-// slashFixture creates the fixture through d: a file, two empty
-// directories, a non-empty one, and symlinks to the file, to a directory and
-// to nothing. It reports whether symlinks could be made.
+// slashLinks are the fixture's symlinks, in the order they are made (a
+// chain's target first, so Windows makes directory links to directories).
+var slashLinks = [][2]string{
+	{"lfile", "file"}, {"ldir", "dir"}, {"ldangle", "nowhere"}, {"lloop", "lloop"},
+	{"lchain", "ldir"}, {"lchainf", "lfile"},
+	{"pl", "r/sub"}, {"r/sub/up", "../target"}, {"r/sub/upd", "../newdir"},
+}
+
+// slashFixture creates the fixture through d: a file, empty directories, a
+// non-empty one, a decoy "target" beside "r/target", and slashLinks. It
+// reports whether symlinks could be made.
 func slashFixture(t *testing.T, d slashFS, create func(name, data string)) bool {
 	t.Helper()
 	create("file", "data")
-	for _, dir := range []string{"dir", "dir2", "full"} {
+	for _, dir := range []string{"dir", "dir2", "full", "r", "r/sub", "r/target", "target"} {
 		if err := d.Mkdir(dir, 0755); err != nil {
 			t.Fatal(err)
 		}
 	}
 	create("full/child", "child")
 	links := true
-	for link, target := range map[string]string{"lfile": "file", "ldir": "dir", "ldangle": "nowhere"} {
-		if err := d.Symlink(target, link); err != nil {
+	for _, l := range slashLinks {
+		if err := d.Symlink(l[1], l[0]); err != nil {
 			links = false
 		}
 	}
@@ -240,7 +265,16 @@ func errClass(err error) string {
 	if errors.As(err, &en) {
 		errno = fmt.Sprintf("%d (%v)", uintptr(en), en)
 	}
-	return fmt.Sprintf("%T errno=%s notexist=%v exist=%v", err, errno,
+	op := "none"
+	var pe *os.PathError
+	var le *os.LinkError
+	switch {
+	case errors.As(err, &pe):
+		op = pe.Op
+	case errors.As(err, &le):
+		op = le.Op
+	}
+	return fmt.Sprintf("%T op=%s errno=%s notexist=%v exist=%v", err, op, errno,
 		errors.Is(err, fs.ErrNotExist), errors.Is(err, fs.ErrExist))
 }
 
@@ -268,7 +302,7 @@ func TestTrailingSlash_MatchesHostOS(t *testing.T) {
 			t.Run(op.name+"/"+name, func(t *testing.T) {
 				od, links := osFixture(t)
 				sd := hostFixture(t, host, true)
-				if !links && strings.HasPrefix(name, "l") {
+				if !links && slashLinked(name) {
 					t.Skip("host can't create symlinks")
 				}
 
@@ -391,6 +425,12 @@ var slashRuleWant = map[slashRules]map[string]string{
 		"RenameFileTo ldir/": "EEXIST", "RenameDirTo ldir/": "EEXIST",
 		"Readlink dir//":     "EINVAL",
 		"RemoveAll missing/": "ok", "RemoveAll nodir/x/": "ok", "RemoveAll file/x/": "ok",
+		"Create lloop/": "EISDIR", "CreateRO lloop/": "EISDIR", "Lstat lloop/": "ELOOP", "MkdirAll lloop/": "EEXIST",
+		"Readlink lloop/": "ELOOP", "Remove lloop/": "ENOTDIR", "RenameFrom lloop/": "ENOTDIR",
+		"RenameFileTo lloop/": "ENOTDIR", "RenameDirTo lloop/": "ENOTDIR",
+		"RenameDirOnto dir/": "ok", "RenameDirOnto dir//": "ok", "RenameDirOnto file/": "ENOTDIR",
+		"RenameDirOnto lfile/": "ENOTDIR", "RenameDirOnto ldir/": "ENOTDIR", "RenameDirOnto ldangle/": "ENOTDIR",
+		"RenameDirOnto lloop/": "ENOTDIR",
 	},
 	slashDarwin: {
 		"Stat file/": "ENOTDIR", "Stat lfile/": "ENOTDIR",
@@ -420,6 +460,12 @@ var slashRuleWant = map[slashRules]map[string]string{
 		"RenameFileTo ldir/": "EEXIST", "RenameDirTo ldir/": "EEXIST",
 		"Readlink dir//":     "EINVAL",
 		"RemoveAll missing/": "ok", "RemoveAll nodir/x/": "ok", "RemoveAll file/x/": "ok",
+		"Lstat lloop/": "ELOOP", "Mkdir lloop/": "ELOOP", "MkdirAll lloop/": "ELOOP", "Readlink lloop/": "ELOOP",
+		"Remove lloop/": "ELOOP", "RenameFrom lloop/": "ELOOP", "RenameFileTo lloop/": "ELOOP",
+		"RenameDirTo lloop/": "ELOOP", "Symlink lloop/": "ELOOP",
+		"RenameDirOnto dir/": "ok", "RenameDirOnto dir//": "ok", "RenameDirOnto file/": "ENOTDIR",
+		"RenameDirOnto lfile/": "ENOTDIR", "RenameDirOnto ldir/": "ok", "RenameDirOnto ldangle/": "ok -dir +nowhere",
+		"RenameDirOnto lloop/": "ELOOP",
 	},
 	slashWindows: {
 		"Stat file/": "ENOTDIR", "Stat lfile/": "ENOTDIR", "Stat ldangle/": "ENOTDIR",
@@ -442,7 +488,35 @@ var slashRuleWant = map[slashRules]map[string]string{
 		"Chdir file/": "ENOTDIR", "Chdir lfile/": "ENOTDIR", "Chdir ldangle/": "ENOTDIR",
 		"MkdirAll ldangle/": "EEXIST", "RenameFileTo file/x/": "ENOTDIR", "RenameDirTo file/x/": "ENOTDIR",
 		"RemoveAll missing/": "ok", "RemoveAll nodir/x/": "ok", "RemoveAll file/x/": "ok",
+		"Stat lloop/": "ENOTDIR", "Lstat lloop/": "ENOTDIR", "Open lloop/": "ENOTDIR", "OpenRDWR lloop/": "ENOTDIR",
+		"Create lloop/": "ENOTDIR", "CreateRO lloop/": "ENOTDIR", "MkdirAll lloop/": "EEXIST",
+		"Remove lloop/": "ENOTDIR", "RemoveAll lloop/": "ENOTDIR", "RenameFrom lloop/": "ENOTDIR",
+		"Chmod lloop/": "ENOTDIR", "Chtimes lloop/": "ENOTDIR", "Truncate lloop/": "ENOTDIR",
+		"ReadDir lloop/": "ENOTDIR", "ReadFile lloop/": "ENOTDIR", "Readlink lloop/": "ENOTDIR",
+		"Symlink lloop/": "ENOTDIR", "RenameDirOnto file/x/": "ENOTDIR",
 	},
+}
+
+// slashRuleAlias names, for an operation or name, the one whose
+// slashRuleWant entries it shares: O_NOFOLLOW changes nothing a trailing
+// slash does (the slash overrides it), and a chain of links behaves as the
+// last link in it.
+var slashRuleAlias = map[string]string{"OpenNofollow": "Open", "lchain/": "ldir/", "lchainf/": "lfile/"}
+
+// slashRuleLookup returns the slashRuleWant entry for op on name under r,
+// looking through slashRuleAlias when there is none of its own.
+func slashRuleLookup(r slashRules, op, name string) (string, bool) {
+	if want, ok := slashRuleWant[r][op+" "+name]; ok {
+		return want, true
+	}
+	if alias, ok := slashRuleAlias[op]; ok {
+		op = alias
+	}
+	if alias, ok := slashRuleAlias[name]; ok {
+		name = alias
+	}
+	want, ok := slashRuleWant[r][op+" "+name]
+	return want, ok
 }
 
 // stateDelta describes how after differs from before as "+name" and
@@ -482,7 +556,7 @@ func errnoName(r slashRules, err error) string {
 	}
 	for name, errno := range map[string]error{
 		"ENOTDIR": notDir, "ENOENT": syscall.ENOENT, "EEXIST": syscall.EEXIST,
-		"EISDIR": syscall.EISDIR, "EINVAL": syscall.EINVAL,
+		"EISDIR": syscall.EISDIR, "EINVAL": syscall.EINVAL, "ELOOP": syscall.ELOOP,
 	} {
 		if errors.Is(err, errno) {
 			return name
@@ -508,7 +582,10 @@ func TestTrailingSlash_PlatformRules(t *testing.T) {
 	for r, rname := range rules {
 		for _, op := range slashOps {
 			for _, name := range slashNames {
-				if !hasTrailingSlash(name) {
+				if !hasTrailingSlash(name) || strings.HasPrefix(name, "pl/") {
+					// memfs doesn't follow a symlink in a directory
+					// component, so the symlinked parent can't be simulated;
+					// TestTrailingSlash_MatchesHostOS covers it on each host.
 					continue
 				}
 				r, op, name := r, op, name
@@ -519,7 +596,7 @@ func TestTrailingSlash_PlatformRules(t *testing.T) {
 					if delta := stateDelta(before, after); delta != "" {
 						got += " " + delta
 					}
-					if want, ok := slashRuleWant[r][op.name+" "+name]; ok {
+					if want, ok := slashRuleLookup(r, op.name, name); ok {
 						if got != want {
 							t.Errorf("got %s (%v), want %s", got, err, want)
 						}
@@ -635,8 +712,17 @@ func TestTrailingSlash_BackendFailures(t *testing.T) {
 			t.Fatal(err)
 		}
 		ff.fail["stat"] = true
+		sfs.slash = slashLinux // Windows reports any unfollowable link as not a directory
 		if _, err := sfs.Stat("/l/"); err != errInjected {
 			t.Fatalf("Stat(/l/) = %v, want the backend's error", err)
+		}
+		// macOS, following the link to remove what it names, fails as
+		// following it did, under the caller's op and name.
+		sfs.slash = slashDarwin
+		err = sfs.Remove("/l/")
+		var pe *os.PathError
+		if !errors.As(err, &pe) || pe.Op != "remove" || pe.Path != "/l/" || pe.Err != errInjected {
+			t.Fatalf("Remove(/l/) = %#v, want *PathError{remove /l/ injected}", err)
 		}
 	})
 
@@ -677,8 +763,100 @@ func TestTrailingSlash_BackendFailures(t *testing.T) {
 		if err := m.Symlink("/loop", "/loop"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := resolveLink(m, "/loop"); err != syscall.ELOOP {
-			t.Fatalf("resolveLink(loop) = %v, want ELOOP", err)
+		if _, err := realPath(m, "/loop", true); err != syscall.ELOOP {
+			t.Fatalf("realPath(loop) = %v, want ELOOP", err)
+		}
+	})
+
+	t.Run("realPath", func(t *testing.T) {
+		m := mustMemFS(t)
+		for _, d := range []string{"/r", "/r/sub", "/r/target", "/target"} {
+			if err := m.Mkdir(d, 0755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		writeFile(t, m, "/f", "x")
+		for link, target := range map[string]string{
+			"/a": "r/sub", "/r/sub/up": "../target", "/abs": "/r/target",
+			"/dots": "./r/../r/./target", "/via": "nope/../target", "/r/sub/new": "../newdir",
+		} {
+			if err := m.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, c := range []struct {
+			p      string
+			follow bool
+			want   string
+			err    error
+		}{
+			// ".." in a target climbs out of where the parent link leads
+			// (r/sub), not out of the name (/a), which would give /target.
+			{"/a/up", true, "/r/target", nil},
+			{"/a/up", false, "/r/sub/up", nil},
+			{"/a/new", true, "/r/newdir", nil},
+			{"/abs", true, "/r/target", nil},
+			{"/dots", true, "/r/target", nil},
+			{"/r/sub/..", false, "/r", nil},
+			{"/..", false, "/", nil},
+			{"r/sub", false, "r/sub", nil},
+			{"/f/x", true, "", syscall.ENOTDIR},
+			{"/nope/x", true, "", fs.ErrNotExist},
+			{"/via", true, "", fs.ErrNotExist},
+		} {
+			got, err := realPath(m, c.p, c.follow)
+			if got != c.want || (c.err == nil) != (err == nil) || (c.err != nil && !errors.Is(err, c.err)) {
+				t.Errorf("realPath(%q, %v) = %q, %v; want %q, %v", c.p, c.follow, got, err, c.want, c.err)
+			}
+		}
+		if sameEntry(m, "/f/x", "/r") {
+			t.Error("sameEntry with an unresolvable source = true")
+		}
+
+		ff := newFaultFS(t)
+		if err := ff.Mkdir("/d", 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := ff.Symlink("d", "/l"); err != nil {
+			t.Fatal(err)
+		}
+		ff.fail["readlink"] = true
+		if _, err := realPath(ff, "/l/x", true); !errors.Is(err, errInjected) {
+			t.Errorf("realPath through a failing Readlink = %v, want the backend's error", err)
+		}
+	})
+
+	t.Run("unwrapErrno", func(t *testing.T) {
+		le := &os.LinkError{Op: "rename", Old: "a", New: "b", Err: syscall.EXDEV}
+		if got := unwrapErrno(le); got != syscall.EXDEV {
+			t.Errorf("unwrapErrno(LinkError) = %v", got)
+		}
+		if got := unwrapErrno(errInjected); got != errInjected {
+			t.Errorf("unwrapErrno(bare) = %v", got)
+		}
+	})
+
+	t.Run("rename onto itself", func(t *testing.T) {
+		// As os.Rename on Unix: the same directory under another spelling
+		// is left alone; the identical name is refused as existing.
+		for _, r := range []slashRules{slashLinux, slashDarwin} {
+			sfs, err := New(WithDefault(mustMemFS(t)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sfs.slash = r
+			if err := sfs.Mkdir("/d", 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := sfs.Rename("/d", "/d/"); err != nil {
+				t.Fatalf("Rename(/d, /d/) = %v", err)
+			}
+			if err := sfs.Rename("/d/", "/d/"); !errors.Is(err, syscall.EEXIST) {
+				t.Fatalf("Rename(/d/, /d/) = %v, want EEXIST", err)
+			}
+			if _, err := sfs.Stat("/d"); err != nil {
+				t.Fatalf("/d after renames onto itself: %v", err)
+			}
 		}
 	})
 

@@ -49,9 +49,13 @@ func hostSlashRules(goos string) slashRules {
 // ERROR_PATH_NOT_FOUND, which matches fs.ErrNotExist.
 const errDirectory = syscall.Errno(267)
 
-// symlinkLoopLimit bounds how many symlinks resolveLink follows, as the
+// symlinkLoopLimit bounds how many symlinks realPath follows, as the
 // kernel's own limit does (40 on Linux, 32 on macOS).
 const symlinkLoopLimit = 40
+
+// errRenameSelf is renameDest's report that a rename names the same
+// directory twice, which rename(2) accepts and does nothing for.
+var errRenameSelf = errors.New("switchfs: rename onto itself")
 
 // hasTrailingSlash reports whether name ends in a slash, which requires the
 // object it names to be a directory.
@@ -59,14 +63,32 @@ func hasTrailingSlash(name string) bool {
 	return strings.HasSuffix(name, "/")
 }
 
-// slashError reports err, from applying a trailing slash to name, as an
-// *os.PathError for op carrying the caller's name. A backend's
-// *os.PathError (from following a symlink) keeps its own Op and error.
-func slashError(op, name string, err error) error {
-	if _, ok := err.(*os.PathError); ok {
-		return pathError(err, name)
+// unwrapErrno returns the error inside a backend's *os.PathError or
+// *os.LinkError, so it can be reported under the caller's op and name.
+func unwrapErrno(err error) error {
+	switch e := err.(type) {
+	case *os.PathError:
+		return e.Err
+	case *os.LinkError:
+		return e.Err
 	}
-	return &os.PathError{Op: op, Path: name, Err: err}
+	return err
+}
+
+// slashError reports err, from applying a trailing slash to name, as an
+// *os.PathError for op carrying the caller's name.
+func slashError(op, name string, err error) error {
+	return &os.PathError{Op: op, Path: name, Err: unwrapErrno(err)}
+}
+
+// withOp reports a backend *os.PathError under op, the operation the caller
+// asked for, when the slash made SwitchFS call a different one (Stat for
+// Lstat, Chown for Lchown).
+func withOp(err error, op string) error {
+	if pe, ok := err.(*os.PathError); ok && pe.Op != op {
+		return &os.PathError{Op: op, Path: pe.Path, Err: pe.Err}
+	}
+	return err
 }
 
 // notDir returns the platform's not-a-directory errno.
@@ -90,49 +112,53 @@ const (
 	kindLinkDir                       // a symlink to a directory
 	kindLinkFile                      // a symlink to a non-directory
 	kindLinkDangling                  // a symlink to nothing
+	kindLinkErr                       // a symlink that can't be followed (a loop, say)
 )
 
 // classify reports what p names in b. A missing name whose parent is not an
 // existing directory is kindUnknown, so the backend reports the problem
-// with the parent as it would without the slash.
-func classify(b absfs.FileSystem, p string) slashKind {
+// with the parent as it would without the slash. For kindLinkErr it also
+// returns the errno following the link failed with (ELOOP for a loop),
+// which is what a trailing slash, by following the link, runs into.
+func classify(b absfs.FileSystem, p string) (slashKind, error) {
 	info, err := lstat(b, p)
 	if errors.Is(err, fs.ErrNotExist) {
 		if parent, err := b.Stat(path.Dir(p)); err == nil && parent.IsDir() {
-			return kindMissing
+			return kindMissing, nil
 		}
-		return kindUnknown
+		return kindUnknown, nil
 	}
 	if err != nil {
-		return kindUnknown
+		return kindUnknown, nil
 	}
 	if info.Mode()&os.ModeSymlink == 0 {
 		if info.IsDir() {
-			return kindDir
+			return kindDir, nil
 		}
-		return kindFile
+		return kindFile, nil
 	}
 	info, err = b.Stat(p)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return kindLinkDangling
+		return kindLinkDangling, nil
 	case err != nil:
-		return kindUnknown
+		return kindLinkErr, unwrapErrno(err)
 	case info.IsDir():
-		return kindLinkDir
+		return kindLinkDir, nil
 	}
-	return kindLinkFile
+	return kindLinkFile, nil
 }
 
 // lookupNotDir reports whether looking up a name with a trailing slash
 // (stat, open, chmod and the like) fails as not a directory. A dangling
 // symlink is not-exist on Unix, where the link is followed, and
-// not-a-directory on Windows, where it is not.
+// not-a-directory on Windows, where it is not; so is a symlink that can't
+// be followed.
 func (fs *SwitchFS) lookupNotDir(k slashKind) bool {
 	switch k {
 	case kindFile, kindLinkFile:
 		return true
-	case kindLinkDangling:
+	case kindLinkDangling, kindLinkErr:
 		return fs.slash == slashWindows
 	}
 	return false
@@ -142,62 +168,116 @@ func (fs *SwitchFS) lookupNotDir(k slashKind) bool {
 // and p, in b, exists and is not a directory. It returns nil otherwise, and
 // the operation goes ahead on p.
 func (fs *SwitchFS) checkSlash(op, name string, b absfs.FileSystem, p string) error {
-	if !hasTrailingSlash(name) || !fs.lookupNotDir(classify(b, p)) {
+	if !hasTrailingSlash(name) {
+		return nil
+	}
+	if k, _ := classify(b, p); !fs.lookupNotDir(k) {
 		return nil
 	}
 	return &os.PathError{Op: op, Path: name, Err: fs.notDir()}
 }
 
-// resolveLink follows symlinks from p in b until it reaches a path that is
-// not a symlink, which may not exist. Relative targets resolve against the
-// link's directory.
-func resolveLink(b absfs.FileSystem, p string) (string, error) {
-	for i := 0; i < symlinkLoopLimit; i++ {
-		info, err := lstat(b, p)
-		if err != nil || info.Mode()&os.ModeSymlink == 0 {
-			return p, nil
-		}
-		target, err := b.(absfs.SymLinker).Readlink(p) // lstat only reports symlinks from a SymLinker
-		if err != nil {
-			return "", err
-		}
-		if !path.IsAbs(target) {
-			target = path.Join(path.Dir(p), target)
-		}
-		p = target
+// realPath resolves p in b as the kernel looks a name up: a symlink in any
+// directory component is followed, and so is a final one when follow is
+// set. A relative link target is resolved against the directory the link
+// was found in after that directory has itself been resolved, so ".." in a
+// target climbs out of where a symlinked parent leads, not out of the name.
+// A missing final component is kept (it is what a dangling link names); a
+// missing or non-directory component before it fails with ENOENT or
+// ENOTDIR, and more than symlinkLoopLimit links with ELOOP.
+func realPath(b absfs.FileSystem, p string, follow bool) (string, error) {
+	resolved := "/"
+	if !path.IsAbs(p) {
+		resolved = "."
 	}
-	return "", syscall.ELOOP
+	rest := strings.Split(p, "/")
+	for links := 0; len(rest) > 0; {
+		elem := rest[0]
+		rest = rest[1:]
+		switch elem {
+		case "", ".":
+			continue
+		case "..":
+			resolved = path.Dir(resolved)
+			continue
+		}
+		next := path.Join(resolved, elem)
+		last := len(rest) == 0
+		info, err := lstat(b, next)
+		switch {
+		case err != nil && last && errors.Is(err, fs.ErrNotExist):
+			return next, nil
+		case err != nil:
+			return "", err
+		case info.Mode()&os.ModeSymlink != 0 && (follow || !last):
+			if links++; links > symlinkLoopLimit {
+				return "", syscall.ELOOP
+			}
+			target, err := b.(absfs.SymLinker).Readlink(next) // lstat only reports symlinks from a SymLinker
+			if err != nil {
+				return "", err
+			}
+			if path.IsAbs(target) {
+				resolved = "/"
+			}
+			rest = append(strings.Split(target, "/"), rest...)
+			continue
+		case !last && !info.IsDir():
+			return "", syscall.ENOTDIR
+		}
+		resolved = next
+	}
+	return resolved, nil
 }
 
-// openSlash applies a trailing slash to OpenFile. With O_CREATE, Linux
-// refuses any such name with EISDIR before looking at it; macOS reports a
-// missing name as ENOENT and Windows as not-a-directory.
-func (fs *SwitchFS) openSlash(b absfs.FileSystem, p string, flag int) error {
-	k := classify(b, p)
+// sameEntry reports whether dst, followed through a final symlink, is the
+// directory entry src names (not followed), both in the one backend b.
+func sameEntry(b absfs.FileSystem, src, dst string) bool {
+	s, err := realPath(b, src, false)
+	if err != nil {
+		return false
+	}
+	d, err := realPath(b, dst, true)
+	return err == nil && s == d
+}
+
+// openSlash applies a trailing slash to OpenFile, returning the flags to
+// open p with or the errno to fail with. With O_CREATE, Linux refuses any
+// such name with EISDIR before looking at it; macOS reports a missing name
+// as ENOENT and Windows as not-a-directory. The slash requires a final
+// symlink to be followed, so it overrides O_NOFOLLOW.
+func (fs *SwitchFS) openSlash(b absfs.FileSystem, p string, flag int) (int, error) {
+	k, _ := classify(b, p)
 	creating := flag&os.O_CREATE != 0
 	switch {
 	case creating && fs.slash == slashLinux && k != kindUnknown:
-		return syscall.EISDIR
+		return flag, syscall.EISDIR
 	case fs.lookupNotDir(k):
-		return fs.notDir()
-	case !creating || (k != kindMissing && k != kindLinkDangling):
-		return nil
-	case fs.slash == slashWindows:
-		return fs.notDir()
+		return flag, fs.notDir()
+	case creating && (k == kindMissing || k == kindLinkDangling):
+		if fs.slash == slashWindows {
+			return flag, fs.notDir()
+		}
+		return flag, syscall.ENOENT
+	case k == kindLinkDir || k == kindLinkDangling || k == kindLinkErr:
+		return flag &^ oNoFollow, nil
 	}
-	return syscall.ENOENT
+	return flag, nil
 }
 
 // mkdir creates p in b for Mkdir(name). On macOS a trailing slash makes
-// mkdir fail on a non-directory with ENOTDIR and create the target of a
-// dangling symlink; elsewhere the backend's own error (EEXIST) stands.
+// mkdir fail on a non-directory with ENOTDIR, on a link that can't be
+// followed with the reason (ELOOP), and create the target of a dangling
+// symlink; elsewhere the backend's own error (EEXIST) stands.
 func (fs *SwitchFS) mkdir(name string, b absfs.FileSystem, p string, perm os.FileMode) error {
 	if hasTrailingSlash(name) && fs.slash == slashDarwin {
-		switch classify(b, p) {
+		switch k, err := classify(b, p); k {
 		case kindFile, kindLinkFile:
 			return &os.PathError{Op: "mkdir", Path: name, Err: fs.notDir()}
+		case kindLinkErr:
+			return &os.PathError{Op: "mkdir", Path: name, Err: err}
 		case kindLinkDangling:
-			target, err := resolveLink(b, p)
+			target, err := realPath(b, p, true)
 			if err != nil {
 				return slashError("mkdir", name, err)
 			}
@@ -211,13 +291,15 @@ func (fs *SwitchFS) mkdir(name string, b absfs.FileSystem, p string, perm os.Fil
 // for name, or the errno they fail with. A trailing slash on a
 // non-directory fails as not a directory. On a symlink to a directory Linux
 // fails with ENOTDIR, macOS acts on the directory the link resolves to, and
-// Windows on the link itself. A dangling symlink is not-a-directory except
-// on macOS, which follows it to ENOENT.
+// Windows on the link itself. A dangling symlink, or one that can't be
+// followed, is not-a-directory except on macOS, which follows it to ENOENT
+// or to whatever stopped it (ELOOP).
 func (fs *SwitchFS) removalPath(name string, b absfs.FileSystem, p string) (string, error) {
 	if !hasTrailingSlash(name) {
 		return p, nil
 	}
-	switch classify(b, p) {
+	k, err := classify(b, p)
+	switch k {
 	case kindFile, kindLinkFile:
 		return "", fs.notDir()
 	case kindLinkDir:
@@ -225,25 +307,33 @@ func (fs *SwitchFS) removalPath(name string, b absfs.FileSystem, p string) (stri
 		case slashLinux:
 			return "", fs.notDir()
 		case slashDarwin:
-			return resolveLink(b, p)
+			return realPath(b, p, true)
 		}
-	case kindLinkDangling:
-		if fs.slash == slashDarwin {
-			return "", syscall.ENOENT
+	case kindLinkDangling, kindLinkErr:
+		switch {
+		case fs.slash != slashDarwin:
+			return "", fs.notDir()
+		case k == kindLinkErr:
+			return "", err
 		}
-		return "", fs.notDir()
+		return "", syscall.ENOENT
 	}
 	return p, nil
 }
 
 // renameDest returns the path a Rename onto newpath (dst in dstB) writes,
 // or the errno it fails with, for a source src in srcB. Windows ignores a
-// trailing slash on the destination unless its parent is a file. On Unix it requires the destination to
-// end up a directory: an existing non-directory is ENOTDIR, and a missing
-// destination for a non-directory source is ENOTDIR on Linux and ENOENT on
-// macOS, which also renames a directory onto the target of a dangling
-// symlink. A symlink to a directory is EEXIST, as os.Rename refuses any
-// destination that Lstat, which follows the slash, finds is a directory.
+// trailing slash on the destination unless its parent is a file. On Unix it
+// requires the destination to end up a directory: an existing
+// non-directory is ENOTDIR, and a missing destination for a non-directory
+// source is ENOTDIR on Linux and ENOENT on macOS, which also renames a
+// directory onto the target of a dangling symlink. A symlink to a directory
+// is EEXIST, as os.Rename refuses any destination that Lstat, which follows
+// the slash, finds is a directory, unless it is the source itself; a
+// directory renamed onto itself is left alone (errRenameSelf), except that
+// Linux refuses to put it at the link's name with ENOTDIR. A link that
+// can't be followed fails as following it does on macOS (ELOOP) and as
+// not-a-directory on Linux.
 func (fs *SwitchFS) renameDest(newpath string, srcB absfs.FileSystem, src string, dstB absfs.FileSystem, dst string) (string, error) {
 	if !hasTrailingSlash(newpath) {
 		return dst, nil
@@ -260,10 +350,19 @@ func (fs *SwitchFS) renameDest(newpath string, srcB absfs.FileSystem, src string
 	if err != nil {
 		return dst, nil // the rename reports the missing source
 	}
-	k := classify(dstB, dst)
+	k, kerr := classify(dstB, dst)
 	switch {
 	case k == kindFile || k == kindLinkFile:
 		return "", fs.notDir()
+	case k == kindLinkErr && fs.slash == slashDarwin:
+		return "", kerr
+	case k == kindLinkErr:
+		return "", fs.notDir()
+	case (k == kindDir || k == kindLinkDir) && sameBackend(srcB, dstB) && sameEntry(dstB, src, dst):
+		if k == kindLinkDir && fs.slash == slashLinux {
+			return "", fs.notDir()
+		}
+		return "", errRenameSelf
 	case k == kindLinkDir:
 		return "", syscall.EEXIST
 	case k != kindMissing && k != kindLinkDangling:
@@ -276,7 +375,7 @@ func (fs *SwitchFS) renameDest(newpath string, srcB absfs.FileSystem, src string
 	case !srcInfo.IsDir():
 		return "", syscall.ENOENT
 	case k == kindLinkDangling:
-		return resolveLink(dstB, dst)
+		return realPath(dstB, dst, true)
 	}
 	return dst, nil
 }
@@ -288,22 +387,23 @@ func (fs *SwitchFS) symlinkSlash(newname string, b absfs.FileSystem, p string) e
 	if !hasTrailingSlash(newname) {
 		return nil
 	}
-	k := classify(b, p)
+	k, err := classify(b, p)
 	switch fs.slash {
 	case slashLinux:
 		if k == kindMissing {
 			return syscall.ENOENT
 		}
 	case slashDarwin:
-		if fs.lookupNotDir(k) {
+		switch {
+		case fs.lookupNotDir(k):
 			return fs.notDir()
-		}
-		if k == kindMissing || k == kindLinkDangling {
+		case k == kindLinkErr:
+			return err
+		case k == kindMissing || k == kindLinkDangling:
 			return syscall.ENOENT
 		}
 	case slashWindows:
-		switch k {
-		case kindFile, kindLinkFile, kindLinkDangling, kindMissing:
+		if k == kindMissing || fs.lookupNotDir(k) {
 			return fs.notDir()
 		}
 	}
@@ -313,12 +413,14 @@ func (fs *SwitchFS) symlinkSlash(newname string, b absfs.FileSystem, p string) e
 // readlinkSlash returns the errno Readlink fails with when name, at p in b,
 // has a trailing slash, or nil to let the backend read the link. Unix
 // resolves the slash through the link, so what's left is never a link:
-// EINVAL for a directory, ENOENT for nothing. Windows reads the link.
+// EINVAL for a directory, ENOENT for nothing, and whatever stopped the
+// resolution (ELOOP) for a link that can't be followed. Windows reads the
+// link.
 func (fs *SwitchFS) readlinkSlash(name string, b absfs.FileSystem, p string) error {
 	if !hasTrailingSlash(name) {
 		return nil
 	}
-	k := classify(b, p)
+	k, err := classify(b, p)
 	if fs.lookupNotDir(k) {
 		return fs.notDir()
 	}
@@ -330,6 +432,8 @@ func (fs *SwitchFS) readlinkSlash(name string, b absfs.FileSystem, p string) err
 		return syscall.EINVAL
 	case kindMissing, kindLinkDangling:
 		return syscall.ENOENT
+	case kindLinkErr:
+		return err
 	}
 	return nil
 }

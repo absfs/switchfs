@@ -30,6 +30,7 @@ func (fs *SwitchFS) Lstat(name string) (os.FileInfo, error) {
 			return nil, err
 		}
 		info, err = backend.Stat(p)
+		err = withOp(err, "lstat")
 	} else {
 		info, err = lstat(backend, p)
 	}
@@ -56,13 +57,13 @@ func (fs *SwitchFS) Lchown(name string, uid, gid int) error {
 	if hasTrailingSlash(name) && fs.ownerChecksSlash() {
 		// A trailing slash resolves a final symlink, so this is a Chown of
 		// whatever the link resolves to.
-		switch k := classify(backend, p); {
+		switch k, _ := classify(backend, p); {
 		case fs.lookupNotDir(k):
 			return &os.PathError{Op: "lchown", Path: name, Err: fs.notDir()}
 		case k == kindLinkDangling:
 			return &os.PathError{Op: "lchown", Path: name, Err: syscall.ENOENT}
 		}
-		return pathError(backend.Chown(p, uid, gid), name)
+		return pathError(withOp(backend.Chown(p, uid, gid), "lchown"), name)
 	}
 	return pathError(l.Lchown(p, uid, gid), name)
 }

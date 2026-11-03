@@ -37,13 +37,17 @@
 // A trailing slash requires a directory, as in os. Cleaning drops it, so
 // SwitchFS remembers that the caller's name had one and checks the object
 // in the backend: on a regular file, or a symlink to one, Stat, Open,
-// Remove, Rename and the other methods fail with an *os.PathError (an
-// *os.LinkError for Rename and Symlink) wrapping the host's not-a-directory
-// error, while Mkdir("dir/") and MkdirAll work as before. The slash resolves
-// a final symlink, so Lstat("link/") describes what link points to. Where
-// hosts differ (the errno, OpenFile with O_CREATE, a symlink to a
-// directory) SwitchFS does what os does on the host it runs on, whatever
-// the backend. On Windows the error is ERROR_DIRECTORY (267), as os
+// Remove, Rename and most other methods fail with an *os.PathError (an
+// *os.LinkError for Rename) wrapping the host's not-a-directory error, while
+// Mkdir("dir/") and MkdirAll work as before. (On Linux, Mkdir, MkdirAll and
+// Symlink of an existing file keep EEXIST, as os does there.) The slash
+// resolves a final symlink, so Lstat("link/") describes what link points
+// to, O_NOFOLLOW doesn't stop OpenFile following it, and a link that can't
+// be followed, such as a loop, fails as following it does (ELOOP). Links
+// are resolved as the kernel resolves them, through symlinked parent
+// directories before any ".." in a target. Where hosts differ (the errno,
+// OpenFile with O_CREATE, a symlink to a directory) SwitchFS does what os
+// does on the host it runs on, whatever the backend. On Windows the error is ERROR_DIRECTORY (267), as os
 // returns there, not syscall.ENOTDIR, which on Windows is
 // ERROR_PATH_NOT_FOUND and would match fs.ErrNotExist. See the README for
 // the full table.

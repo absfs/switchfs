@@ -57,7 +57,12 @@ destinations.
   and `MkdirAll` work as before, and the details that differ by host
   (`OpenFile` with `O_CREATE`, `Mkdir` on a file, `Remove` and `Rename` of a
   symlink to a directory, a slash on a `Rename` destination) follow `os` on
-  the host. A table-driven test compares every method with `os` on the host.
+  the host. The slash overrides `O_NOFOLLOW`, a symlink loop fails with
+  `ELOOP` (on Linux `ENOTDIR` for `Remove` and `Rename`, as there) instead of
+  the link being removed or renamed, and links are resolved through symlinked
+  parent directories before a target's `..`, so a slash never redirects a
+  `Remove`, `Rename` or `Mkdir` to a different directory than `os` would use.
+  A table-driven test compares every method with `os` on the host.
 
 ### Added
 
