@@ -1,8 +1,11 @@
 package switchfs
 
 import (
+	"path"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/absfs/absfs"
@@ -83,11 +86,12 @@ func TestSwitchFS_MultiBackend(t *testing.T) {
 	suite.Run(t)
 }
 
-// The suites below run with rewriting routes. Their symlink sections are
-// off: the suite links to absolute virtual paths, and switchfs stores link
+// The suites below run with rewriting routes. Their symlink groups are off:
+// the suite links to absolute virtual paths, and switchfs stores link
 // targets verbatim, so a backend following such a link looks for the
 // virtual path in its own (rewritten) namespace. That is the documented
-// behaviour; relative targets are covered in symlink_test.go.
+// behaviour. The SymlinkSuite tests further down rerun the symlink group
+// through relLinks, which stores those targets as relative links.
 
 // TestSwitchFS_Suite_StripPrefix runs the suite in a route that strips its
 // prefix, so every operation reaches the backend under a different path.
@@ -189,5 +193,148 @@ func TestSwitchFS_Suite_OSFSRewrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	suite := &fstesting.Suite{FS: fs, Features: features(false), TestDir: "/work"}
+	suite.Run(t)
+}
+
+// relLinks presents a SwitchFS to fstesting with absolute symlink targets
+// stored as relative ones, the form the package documentation recommends.
+// The suite links to absolute virtual paths, which a backend behind a
+// rewriting route can't follow (targets are opaque); converting them lets
+// the suite's symlink group run through rewriting routes too. Readlink
+// returns a converted target as the suite wrote it.
+type relLinks struct {
+	*SwitchFS
+	mu   sync.Mutex
+	orig map[string]string // link path -> absolute target as given
+}
+
+func newRelLinks(sfs *SwitchFS) *relLinks {
+	return &relLinks{SwitchFS: sfs, orig: map[string]string{}}
+}
+
+func (r *relLinks) Symlink(oldname, newname string) error {
+	target := oldname
+	if path.IsAbs(oldname) && path.IsAbs(newname) {
+		target = relPath(path.Dir(path.Clean(newname)), path.Clean(oldname))
+	}
+	if err := r.SwitchFS.Symlink(target, newname); err != nil {
+		return err
+	}
+	if target != oldname {
+		r.mu.Lock()
+		r.orig[path.Clean(newname)] = oldname
+		r.mu.Unlock()
+	}
+	return nil
+}
+
+func (r *relLinks) Readlink(name string) (string, error) {
+	target, err := r.SwitchFS.Readlink(name)
+	if err != nil {
+		return target, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if orig, ok := r.orig[path.Clean(name)]; ok {
+		return orig, nil
+	}
+	return target, nil
+}
+
+func (r *relLinks) Rename(oldpath, newpath string) error {
+	if err := r.SwitchFS.Rename(oldpath, newpath); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if orig, ok := r.orig[path.Clean(oldpath)]; ok {
+		delete(r.orig, path.Clean(oldpath))
+		r.orig[path.Clean(newpath)] = orig
+	}
+	return nil
+}
+
+func (r *relLinks) Remove(name string) error {
+	r.mu.Lock()
+	delete(r.orig, path.Clean(name))
+	r.mu.Unlock()
+	return r.SwitchFS.Remove(name)
+}
+
+// relPath returns the relative path from directory from to target, both
+// clean absolute slash paths.
+func relPath(from, target string) string {
+	split := func(p string) []string {
+		if p == "/" {
+			return nil
+		}
+		return strings.Split(strings.TrimPrefix(p, "/"), "/")
+	}
+	f, t := split(from), split(target)
+	i := 0
+	for i < len(f) && i < len(t) && f[i] == t[i] {
+		i++
+	}
+	var parts []string
+	for range f[i:] {
+		parts = append(parts, "..")
+	}
+	parts = append(parts, t[i:]...)
+	if len(parts) == 0 {
+		return "."
+	}
+	return strings.Join(parts, "/")
+}
+
+func TestRelPath(t *testing.T) {
+	for _, tt := range []struct{ from, to, want string }{
+		{"/a/b", "/a/b/c", "c"},
+		{"/a/b", "/a/c", "../c"},
+		{"/", "/x/y", "x/y"},
+		{"/x/y", "/", "../.."},
+		{"/a", "/a", "."},
+	} {
+		if got := relPath(tt.from, tt.to); got != tt.want {
+			t.Errorf("relPath(%q, %q) = %q, want %q", tt.from, tt.to, got, tt.want)
+		}
+	}
+}
+
+// The suites below rerun the rewriting setups with the symlink group on,
+// through relLinks.
+
+func TestSwitchFS_SymlinkSuite_StripPrefix(t *testing.T) {
+	fs, err := New(
+		WithDefault(mustMemFS(t)),
+		WithRoute("/tmp", mustMemFS(t), WithPriority(100), WithRewriter(StripPrefix("/tmp"))),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	suite := &fstesting.Suite{FS: newRelLinks(fs), Features: features(true)}
+	suite.Run(t)
+}
+
+func TestSwitchFS_SymlinkSuite_WorkspaceRegex(t *testing.T) {
+	sfs, _, _ := workspaceFS(t, "ws")
+	suite := &fstesting.Suite{FS: newRelLinks(sfs), Features: features(true), TestDir: "/ws"}
+	suite.Run(t)
+}
+
+func TestSwitchFS_SymlinkSuite_OSFSRewrite(t *testing.T) {
+	skipOSFSOnWindows(t)
+	host, err := osfs.NewFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := hostTempDir(t)
+	fs, err := New(
+		WithDefault(mustMemFS(t)),
+		WithRoute("/work", host, WithPriority(100), WithRewriter(ReplacePrefix("/work", dir))),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	suite := &fstesting.Suite{FS: newRelLinks(fs), Features: features(true), TestDir: "/work"}
 	suite.Run(t)
 }
