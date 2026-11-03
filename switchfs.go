@@ -176,7 +176,7 @@ func (fs *SwitchFS) OpenFile(name string, flag int, perm os.FileMode) (absfs.Fil
 	if err != nil {
 		return nil, err
 	}
-	if hasTrailingSlash(name) {
+	if fs.slashed(name, backend, p) {
 		if flag, err = fs.openSlash(backend, p, flag); err != nil {
 			return nil, &os.PathError{Op: "open", Path: name, Err: err}
 		}
@@ -214,7 +214,7 @@ func (fs *SwitchFS) MkdirAll(name string, perm os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	if hasTrailingSlash(name) {
+	if fs.slashed(name, backend, p) {
 		switch k, _ := classify(backend, p); k {
 		case kindFile, kindLinkFile, kindLinkDangling, kindLinkErr:
 			// Something that isn't a directory is in the way: fail as
@@ -262,7 +262,7 @@ func (fs *SwitchFS) RemoveAll(name string) error {
 	if err != nil {
 		return err
 	}
-	if hasTrailingSlash(name) {
+	if fs.slashed(name, backend, p) {
 		// As os.RemoveAll does, try a plain Remove of the name, slash and
 		// all, first, and stop if it worked or found nothing to remove. A
 		// not-a-directory from the slash rule never counts as nothing, even

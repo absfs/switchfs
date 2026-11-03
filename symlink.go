@@ -24,7 +24,7 @@ func (fs *SwitchFS) Lstat(name string) (os.FileInfo, error) {
 		return nil, err
 	}
 	var info os.FileInfo
-	if hasTrailingSlash(name) {
+	if fs.slashed(name, backend, p) {
 		// A trailing slash resolves a final symlink, so this is a Stat.
 		if err := fs.checkSlash("lstat", name, backend, p); err != nil {
 			return nil, err
@@ -54,7 +54,7 @@ func (fs *SwitchFS) Lchown(name string, uid, gid int) error {
 	if !ok {
 		return &os.PathError{Op: "lchown", Path: name, Err: ErrSymlinkNotSupported}
 	}
-	if hasTrailingSlash(name) && fs.ownerChecksSlash() {
+	if fs.ownerChecksSlash() && fs.slashed(name, backend, p) {
 		// A trailing slash resolves a final symlink, so this is a Chown of
 		// whatever the link resolves to.
 		switch k, _ := classify(backend, p); {

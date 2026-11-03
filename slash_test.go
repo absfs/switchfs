@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -181,7 +182,10 @@ var slashOps = []slashOp{
 		data, err := d.ReadFile(n)
 		return string(data), err
 	}},
-	{"Readlink", func(d slashFS, n string) (string, error) { return d.Readlink(n) }},
+	{"Readlink", func(d slashFS, n string) (string, error) {
+		target, err := d.Readlink(n)
+		return filepath.ToSlash(target), err // osfs reports targets with slashes
+	}},
 	{"Symlink", func(d slashFS, n string) (string, error) { return "", d.Symlink("file", n) }},
 	{"Chdir", func(d slashFS, n string) (string, error) { return "", d.Chdir(n) }},
 }
@@ -194,7 +198,7 @@ var slashOps = []slashOp{
 // link leads to, as the kernel does, and not against the name.
 var slashNames = []string{
 	"file/", "dir/", "full/", "missing/", "lfile/", "ldir/", "ldangle/",
-	"lloop/", "lchain/", "lchainf/", "pl/up/", "pl/upd/",
+	"lloop/", "lchain/", "lchainf/", "pl/up/", "pl/upd/", "pl/f/", "pl/d1/", "r/sub/upd/",
 	"nodir/x/", "file/x/", "dir//",
 	"file", "dir", "missing", "ldir", "ldangle", "lloop",
 }
@@ -202,7 +206,7 @@ var slashNames = []string{
 // slashLinked reports whether name involves a symlink, so needs a host that
 // can make them.
 func slashLinked(name string) bool {
-	return strings.HasPrefix(name, "l") || strings.HasPrefix(name, "pl/")
+	return strings.HasPrefix(name, "l") || strings.HasPrefix(name, "pl/") || strings.HasPrefix(name, "r/")
 }
 
 // slashTree lists every name the fixture has or an operation might create,
@@ -211,6 +215,7 @@ var slashTree = []string{
 	"file", "dir", "dir2", "full", "full/child", "missing", "new", "nowhere",
 	"lfile", "ldir", "ldangle", "lloop", "lchain", "lchainf", "nodir", "dir/x", "dir2/x",
 	"r", "r/sub", "r/target", "r/newdir", "target", "newdir", "pl", "r/sub/up", "r/sub/upd",
+	"r/sub/f", "r/sub/d1", "r/sub/nowhere1",
 }
 
 // slashLinks are the fixture's symlinks, in the order they are made (a
@@ -218,7 +223,7 @@ var slashTree = []string{
 var slashLinks = [][2]string{
 	{"lfile", "file"}, {"ldir", "dir"}, {"ldangle", "nowhere"}, {"lloop", "lloop"},
 	{"lchain", "ldir"}, {"lchainf", "lfile"},
-	{"pl", "r/sub"}, {"r/sub/up", "../target"}, {"r/sub/upd", "../newdir"},
+	{"pl", "r/sub"}, {"r/sub/up", "../target"}, {"r/sub/upd", "../newdir"}, {"r/sub/d1", "nowhere1"},
 }
 
 // slashFixture creates the fixture through d: a file, empty directories, a
@@ -233,6 +238,7 @@ func slashFixture(t *testing.T, d slashFS, create func(name, data string)) bool 
 		}
 	}
 	create("full/child", "child")
+	create("r/sub/f", "f")
 	links := true
 	for _, l := range slashLinks {
 		if err := d.Symlink(l[1], l[0]); err != nil {
@@ -265,10 +271,13 @@ func errClass(err error) string {
 	if errors.As(err, &en) {
 		errno = fmt.Sprintf("%d (%v)", uintptr(en), en)
 	}
+	// os on Windows names the system call (CreateFile, say) as the Op, so
+	// only Unix hosts, where it names the method, compare it.
 	op := "none"
 	var pe *os.PathError
 	var le *os.LinkError
 	switch {
+	case runtime.GOOS == "windows":
 	case errors.As(err, &pe):
 		op = pe.Op
 	case errors.As(err, &le):
@@ -499,9 +508,15 @@ var slashRuleWant = map[slashRules]map[string]string{
 
 // slashRuleAlias names, for an operation or name, the one whose
 // slashRuleWant entries it shares: O_NOFOLLOW changes nothing a trailing
-// slash does (the slash overrides it), and a chain of links behaves as the
-// last link in it.
-var slashRuleAlias = map[string]string{"OpenNofollow": "Open", "lchain/": "ldir/", "lchainf/": "lfile/"}
+// slash does (the slash overrides it), a chain of links behaves as the last
+// link in it, and r/sub/upd, a dangling link with a ".." target, as
+// ldangle, but with its own target (r/newdir for nowhere).
+var slashRuleAlias = map[string]string{
+	"OpenNofollow": "Open", "lchain/": "ldir/", "lchainf/": "lfile/", "r/sub/upd/": "ldangle/",
+}
+
+// slashAliasTarget maps an aliased name's link target to its own.
+var slashAliasTarget = map[string][2]string{"r/sub/upd/": {"nowhere", "r/newdir"}}
 
 // slashRuleLookup returns the slashRuleWant entry for op on name under r,
 // looking through slashRuleAlias when there is none of its own.
@@ -512,10 +527,14 @@ func slashRuleLookup(r slashRules, op, name string) (string, bool) {
 	if alias, ok := slashRuleAlias[op]; ok {
 		op = alias
 	}
+	target := slashAliasTarget[name]
 	if alias, ok := slashRuleAlias[name]; ok {
 		name = alias
 	}
 	want, ok := slashRuleWant[r][op+" "+name]
+	if target[0] != "" {
+		want = strings.ReplaceAll(want, target[0], target[1])
+	}
 	return want, ok
 }
 
@@ -823,6 +842,36 @@ func TestTrailingSlash_BackendFailures(t *testing.T) {
 		ff.fail["readlink"] = true
 		if _, err := realPath(ff, "/l/x", true); !errors.Is(err, errInjected) {
 			t.Errorf("realPath through a failing Readlink = %v, want the backend's error", err)
+		}
+	})
+
+	t.Run("windows ignores a slash through a symlinked directory", func(t *testing.T) {
+		m := mustMemFS(t)
+		if err := m.MkdirAll("/r/sub", 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Symlink("r/sub", "/pl"); err != nil {
+			t.Fatal(err)
+		}
+		sfs, err := New(WithDefault(m))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range []struct {
+			r    slashRules
+			name string
+			want bool
+		}{
+			{slashWindows, "/pl/f/", false},
+			{slashWindows, "/r/sub/f/", true},
+			{slashWindows, "/r/sub/f", false},
+			{slashLinux, "/pl/f/", true},
+			{slashDarwin, "/pl/f/", true},
+		} {
+			sfs.slash = c.r
+			if got := sfs.slashed(c.name, m, path.Clean(c.name)); got != c.want {
+				t.Errorf("rules %v: slashed(%q) = %v, want %v", c.r, c.name, got, c.want)
+			}
 		}
 	})
 
