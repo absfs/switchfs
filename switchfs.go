@@ -63,13 +63,6 @@ func (fs *SwitchFS) abs(name string) string {
 	return path.Join(cwd, name)
 }
 
-// getBackend finds the backend for a virtual path. It applies the same
-// routing as every operation but discards the rewritten path.
-func (fs *SwitchFS) getBackend(name string) (absfs.FileSystem, error) {
-	backend, _, err := fs.getBackendAndRewrite(name, nil)
-	return backend, err
-}
-
 // getBackendAndRewrite finds the backend for a virtual path and the path to
 // hand that backend. The route's Rewriter, if any, is applied, and a rewrite
 // that yields "" becomes "/". Paths that match no route go unchanged to the
@@ -97,9 +90,22 @@ func (fs *SwitchFS) getBackendAndRewrite(name string, info os.FileInfo) (absfs.F
 	return route.Backend, rewritten, nil
 }
 
-// resolve turns a caller's name into a backend and a backend path.
-func (fs *SwitchFS) resolve(name string) (absfs.FileSystem, string, error) {
-	return fs.getBackendAndRewrite(fs.abs(name), nil)
+// resolveVirtual turns a caller's name into its virtual path, a backend and
+// a backend path. An empty name fails with an *os.PathError for op wrapping
+// ENOENT, as it does in package os; it never means the working directory.
+func (fs *SwitchFS) resolveVirtual(op, name string) (vpath string, backend absfs.FileSystem, p string, err error) {
+	if name == "" {
+		return "", nil, "", &os.PathError{Op: op, Path: name, Err: syscall.ENOENT}
+	}
+	vpath = fs.abs(name)
+	backend, p, err = fs.getBackendAndRewrite(vpath, nil)
+	return vpath, backend, p, err
+}
+
+// resolve is resolveVirtual without the virtual path.
+func (fs *SwitchFS) resolve(op, name string) (absfs.FileSystem, string, error) {
+	_, backend, p, err := fs.resolveVirtual(op, name)
+	return backend, p, err
 }
 
 // sameBackend reports whether a and b are the same filesystem. Backends whose
@@ -120,8 +126,7 @@ func sameBackend(a, b absfs.FileSystem) bool {
 // exist and be a directory. The working directory is virtual; backends'
 // own working directories are never changed.
 func (fs *SwitchFS) Chdir(dir string) error {
-	v := fs.abs(dir)
-	backend, p, err := fs.getBackendAndRewrite(v, nil)
+	v, backend, p, err := fs.resolveVirtual("chdir", dir)
 	if err != nil {
 		return err
 	}
@@ -158,7 +163,7 @@ func (fs *SwitchFS) TempDir() string {
 // OpenFile opens a file with the specified flags and permissions. The
 // returned file's Name is the name passed in, not the backend path.
 func (fs *SwitchFS) OpenFile(name string, flag int, perm os.FileMode) (absfs.File, error) {
-	backend, p, err := fs.resolve(name)
+	vpath, backend, p, err := fs.resolveVirtual("open", name)
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +171,7 @@ func (fs *SwitchFS) OpenFile(name string, flag int, perm os.FileMode) (absfs.Fil
 	if err != nil {
 		return nil, pathError(err, name)
 	}
-	return wrapFile(f, name, fs.abs(name)), nil
+	return wrapFile(f, name, vpath), nil
 }
 
 // Open opens a file for reading.
@@ -181,7 +186,7 @@ func (fs *SwitchFS) Create(name string) (absfs.File, error) {
 
 // Mkdir creates a directory.
 func (fs *SwitchFS) Mkdir(name string, perm os.FileMode) error {
-	backend, p, err := fs.resolve(name)
+	backend, p, err := fs.resolve("mkdir", name)
 	if err != nil {
 		return err
 	}
@@ -191,7 +196,7 @@ func (fs *SwitchFS) Mkdir(name string, perm os.FileMode) error {
 // MkdirAll creates a directory and any missing parents. Parents are created
 // in the backend the full path routes to, under its rewritten path.
 func (fs *SwitchFS) MkdirAll(name string, perm os.FileMode) error {
-	backend, p, err := fs.resolve(name)
+	backend, p, err := fs.resolve("mkdir", name)
 	if err != nil {
 		return err
 	}
@@ -200,7 +205,7 @@ func (fs *SwitchFS) MkdirAll(name string, perm os.FileMode) error {
 
 // Remove removes a file or empty directory.
 func (fs *SwitchFS) Remove(name string) error {
-	backend, p, err := fs.resolve(name)
+	backend, p, err := fs.resolve("remove", name)
 	if err != nil {
 		return err
 	}
@@ -211,8 +216,18 @@ func (fs *SwitchFS) Remove(name string) error {
 // path routes to. Removing a route's own root (for example "/ws" routed with
 // StripPrefix("/ws")) removes the backend root's contents, as the backend
 // does for RemoveAll("/").
+//
+// As in package os, an empty name is a no-op that returns nil, and a name
+// whose last element is "." fails with EINVAL. So does a last element of
+// "..": cleaning would otherwise turn "a/.." into the working directory.
 func (fs *SwitchFS) RemoveAll(name string) error {
-	backend, p, err := fs.resolve(name)
+	if name == "" {
+		return nil
+	}
+	if base := path.Base(name); base == "." || base == ".." {
+		return &os.PathError{Op: "RemoveAll", Path: name, Err: syscall.EINVAL}
+	}
+	backend, p, err := fs.resolve("RemoveAll", name)
 	if err != nil {
 		return err
 	}
@@ -225,11 +240,14 @@ func (fs *SwitchFS) RemoveAll(name string) error {
 // one, which is not atomic. Errors are *os.LinkError values carrying the
 // caller's paths.
 func (fs *SwitchFS) Rename(oldpath, newpath string) error {
-	oldBackend, op, err := fs.resolve(oldpath)
+	if oldpath == "" || newpath == "" {
+		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: syscall.ENOENT}
+	}
+	oldBackend, op, err := fs.resolve("rename", oldpath)
 	if err != nil {
 		return err
 	}
-	newBackend, np, err := fs.resolve(newpath)
+	newBackend, np, err := fs.resolve("rename", newpath)
 	if err != nil {
 		return err
 	}
@@ -242,7 +260,7 @@ func (fs *SwitchFS) Rename(oldpath, newpath string) error {
 
 // Stat returns file information, following symlinks inside the backend.
 func (fs *SwitchFS) Stat(name string) (os.FileInfo, error) {
-	backend, p, err := fs.resolve(name)
+	vpath, backend, p, err := fs.resolveVirtual("stat", name)
 	if err != nil {
 		return nil, err
 	}
@@ -250,12 +268,12 @@ func (fs *SwitchFS) Stat(name string) (os.FileInfo, error) {
 	if err != nil {
 		return nil, pathError(err, name)
 	}
-	return wrapInfo(info, fs.abs(name)), nil
+	return wrapInfo(info, vpath), nil
 }
 
 // Chmod changes file permissions.
 func (fs *SwitchFS) Chmod(name string, mode os.FileMode) error {
-	backend, p, err := fs.resolve(name)
+	backend, p, err := fs.resolve("chmod", name)
 	if err != nil {
 		return err
 	}
@@ -264,7 +282,7 @@ func (fs *SwitchFS) Chmod(name string, mode os.FileMode) error {
 
 // Chtimes changes file access and modification times.
 func (fs *SwitchFS) Chtimes(name string, atime time.Time, mtime time.Time) error {
-	backend, p, err := fs.resolve(name)
+	backend, p, err := fs.resolve("chtimes", name)
 	if err != nil {
 		return err
 	}
@@ -273,7 +291,7 @@ func (fs *SwitchFS) Chtimes(name string, atime time.Time, mtime time.Time) error
 
 // Chown changes file owner and group.
 func (fs *SwitchFS) Chown(name string, uid, gid int) error {
-	backend, p, err := fs.resolve(name)
+	backend, p, err := fs.resolve("chown", name)
 	if err != nil {
 		return err
 	}
@@ -282,7 +300,7 @@ func (fs *SwitchFS) Chown(name string, uid, gid int) error {
 
 // Truncate changes the size of a file.
 func (fs *SwitchFS) Truncate(name string, size int64) error {
-	backend, p, err := fs.resolve(name)
+	backend, p, err := fs.resolve("truncate", name)
 	if err != nil {
 		return err
 	}
@@ -299,7 +317,7 @@ func (fs *SwitchFS) Router() Router {
 // backend the directory routes to is listed: routes below the directory are
 // not merged in (see the package documentation for listing route parents).
 func (fs *SwitchFS) ReadDir(name string) ([]fs.DirEntry, error) {
-	backend, p, err := fs.resolve(name)
+	backend, p, err := fs.resolve("open", name)
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +330,7 @@ func (fs *SwitchFS) ReadDir(name string) ([]fs.DirEntry, error) {
 
 // ReadFile reads the named file and returns its contents.
 func (fs *SwitchFS) ReadFile(name string) ([]byte, error) {
-	backend, p, err := fs.resolve(name)
+	backend, p, err := fs.resolve("open", name)
 	if err != nil {
 		return nil, err
 	}
@@ -326,7 +344,13 @@ func (fs *SwitchFS) ReadFile(name string) ([]byte, error) {
 // Sub returns a read-only fs.FS rooted at dir. The subtree is served through
 // this SwitchFS, so paths below dir keep routing (and rewriting) even when
 // they cross into other routes.
+//
+// An empty dir fails with an *os.PathError wrapping ENOENT; use "." for the
+// working directory.
 func (fs *SwitchFS) Sub(dir string) (fs.FS, error) {
+	if dir == "" {
+		return nil, &os.PathError{Op: "sub", Path: dir, Err: syscall.ENOENT}
+	}
 	return absfs.FilerToFS(fs, fs.abs(dir))
 }
 

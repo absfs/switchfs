@@ -41,3 +41,10 @@ func readFile(t testing.TB, fs absfs.FileSystem, name string) string {
 	}
 	return string(data)
 }
+
+// getBackend finds the backend for a virtual path, discarding the rewritten
+// path. Production code uses resolve; this is a test convenience.
+func (fs *SwitchFS) getBackend(name string) (absfs.FileSystem, error) {
+	backend, _, err := fs.getBackendAndRewrite(name, nil)
+	return backend, err
+}

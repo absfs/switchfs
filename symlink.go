@@ -2,6 +2,7 @@ package switchfs
 
 import (
 	"os"
+	"syscall"
 
 	"github.com/absfs/absfs"
 )
@@ -16,7 +17,7 @@ func symlinker(b absfs.FileSystem) (absfs.SymLinker, bool) {
 // path is routed and rewritten like Stat. When the backend has no symlink
 // support (doesn't implement absfs.SymLinker), Lstat falls back to Stat.
 func (fs *SwitchFS) Lstat(name string) (os.FileInfo, error) {
-	backend, p, err := fs.resolve(name)
+	vpath, backend, p, err := fs.resolveVirtual("lstat", name)
 	if err != nil {
 		return nil, err
 	}
@@ -24,14 +25,14 @@ func (fs *SwitchFS) Lstat(name string) (os.FileInfo, error) {
 	if err != nil {
 		return nil, pathError(err, name)
 	}
-	return wrapInfo(info, fs.abs(name)), nil
+	return wrapInfo(info, vpath), nil
 }
 
 // Lchown changes the owner and group of name without following a final
 // symlink. It fails with an *os.PathError wrapping ErrSymlinkNotSupported
 // when the backend has no symlink support.
 func (fs *SwitchFS) Lchown(name string, uid, gid int) error {
-	backend, p, err := fs.resolve(name)
+	backend, p, err := fs.resolve("lchown", name)
 	if err != nil {
 		return err
 	}
@@ -46,7 +47,7 @@ func (fs *SwitchFS) Lchown(name string, uid, gid int) error {
 // targets are never rewritten. It fails with an *os.PathError wrapping
 // ErrSymlinkNotSupported when the backend has no symlink support.
 func (fs *SwitchFS) Readlink(name string) (string, error) {
-	backend, p, err := fs.resolve(name)
+	backend, p, err := fs.resolve("readlink", name)
 	if err != nil {
 		return "", err
 	}
@@ -68,7 +69,10 @@ func (fs *SwitchFS) Readlink(name string) (string, error) {
 // Errors are *os.LinkError values carrying oldname and newname; the error
 // wraps ErrSymlinkNotSupported when the backend has no symlink support.
 func (fs *SwitchFS) Symlink(oldname, newname string) error {
-	backend, p, err := fs.resolve(newname)
+	if newname == "" {
+		return &os.LinkError{Op: "symlink", Old: oldname, New: newname, Err: syscall.ENOENT}
+	}
+	backend, p, err := fs.resolve("symlink", newname)
 	if err != nil {
 		return err
 	}
