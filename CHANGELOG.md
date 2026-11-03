@@ -1,0 +1,74 @@
+# Changelog
+
+All notable changes to switchfs are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
+uses [Semantic Versioning](https://semver.org/).
+
+## [Unreleased]
+
+### Fixed
+
+- **A route's `Rewriter` is now applied.** Every path-taking method (`OpenFile`,
+  `Open`, `Create`, `Mkdir`, `MkdirAll`, `Remove`, `RemoveAll`, `Rename` with
+  both paths and cross-backend moves, `Stat`, `Chmod`, `Chtimes`, `Chown`,
+  `Truncate`, `ReadDir`, `ReadFile`, `Sub`, `Chdir`) routes through the rewrite.
+  In v1.0.0 rewriters were ignored and every backend received the full virtual
+  path. A rewrite that yields `""` becomes `"/"`.
+- Relative paths are resolved against the SwitchFS working directory before
+  routing, and every path is cleaned, so `/ws/../x` routes as `/x`. In v1.0.0
+  relative paths went to the backend unresolved and `Chdir` had no effect on
+  routing.
+- Data race: `RouteWithInfo` returned a pointer into the router's route slice,
+  which a concurrent `AddRoute` (in-place sort) or `RemoveRoute` (in-place
+  shift) mutated. It now returns a copy, and route changes build a new slice.
+- Prefix patterns match whole path components: `/data` matches `/data` and
+  `/data/x`, no longer `/database`.
+- Cross-backend moves recreate symlinks instead of copying their targets, keep
+  a file's permission bits and (where the backend allows) its modification time,
+  and close the source before removing it.
+
+### Added
+
+- `SwitchFS` implements `absfs.SymlinkFileSystem`: `Lstat`, `Lchown`,
+  `Readlink` and `Symlink`, routed and rewritten like every other method. On a
+  backend without symlink support `Lstat` falls back to `Stat` and the others
+  return an error wrapping the new `ErrSymlinkNotSupported` (which matches
+  `errors.ErrUnsupported`). Link targets are stored and returned verbatim.
+- Callers see their own paths: `*os.PathError` values carry the caller's name,
+  `Rename` and `Symlink` return `*os.LinkError` with the caller's paths, files
+  report the caller's name from `Name()`, and `FileInfo.Name()` is the base of
+  the virtual path (so a route root stripped to `/` is still called by its
+  name).
+- `SwitchFS.AddRoute(pattern, backend, opts...)` and
+  `SwitchFS.RemoveRoute(pattern, type)` for changing routes while serving, and
+  the `TypedRouteRemover` interface (`RemoveRouteOfType`), implemented by the
+  default router, to remove a route by pattern and type together.
+- Package documentation (`doc.go`), runnable examples, and fstesting runs over
+  rewriting routes and an osfs backend.
+
+### Changed
+
+- Operations now evaluate a route's `Condition` (with a nil `os.FileInfo`), as
+  `RouteWithInfo` always did; in v1.0.0 operations used `Route`, which ignores
+  conditions. Built-in metadata conditions treat a nil info as a match, but
+  `Not(...)` of one never matches during an operation.
+- `Chdir` checks that the target exists and is a directory, like `os.Chdir`,
+  and leaves the working directory unchanged when it isn't.
+- `Sub` serves the subtree through the SwitchFS itself, so routes below `dir`
+  keep working inside the returned `fs.FS`.
+- Routes of equal priority are tried in the order they were added (the sort is
+  now stable).
+- `Rename` errors from a backend are reported as `*os.LinkError`, as the
+  `absfs.Filer` contract specifies.
+
+### Unchanged on purpose
+
+- Operations on a path with no route and no default still return `ErrNoRoute`
+  unwrapped, and backend errors that aren't `*os.PathError` pass through as is,
+  so `err == ErrNoRoute` and similar comparisons keep working.
+- `Router.RemoveRoute(pattern)` still matches the pattern alone.
+- `Route.Failover` is still recorded but not used.
+
+## [1.0.0]
+
+- First stable release for absfs 1.0.
