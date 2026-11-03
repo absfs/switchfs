@@ -6,6 +6,16 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Planned as v1.1.0. The behaviour changes below (under Fixed and Changed) make
+switchfs do what v1.0.0 documented or what `os` does; they are treated as bug
+fixes, not breaking changes, and no exported API is removed or changed.
+Callers that relied on the old behaviour should check `Chdir` (now fails on a
+missing or non-directory target, and with `ErrNoRoute` on an unrouted path when
+there is no default backend), `Rename` errors (now `*os.LinkError`), prefix
+matching (`/data` no longer matches `/database`), conditions (now evaluated
+during operations), empty names (now `ENOENT`), and cross-backend renames
+onto existing destinations.
+
 ### Fixed
 
 - **A route's `Rewriter` is now applied.** Every path-taking method (`OpenFile`,
@@ -26,6 +36,16 @@ uses [Semantic Versioning](https://semver.org/).
 - Cross-backend moves recreate symlinks instead of copying their targets, keep
   a file's permission bits and (where the backend allows) its modification time,
   and close the source before removing it.
+- Cross-backend moves treat an existing destination as `rename(2)` does: a file
+  or symlink replaces a non-directory (a symlink there is replaced, not written
+  through) and fails with `EISDIR` on a directory; a directory replaces only an
+  empty directory and fails with `ENOTEMPTY` or `ENOTDIR` otherwise. Previously
+  a file was written through a destination symlink and a directory was merged
+  into a non-empty one.
+- An empty name fails with `ENOENT` (as in `os`) in every method instead of
+  reaching the backend; `RemoveAll("")` is a no-op returning nil, and
+  `RemoveAll` of a name ending in `.` or `..` fails with `EINVAL`, so cleaning
+  can never turn it into a removal of the working directory.
 
 ### Added
 
@@ -42,7 +62,9 @@ uses [Semantic Versioning](https://semver.org/).
 - `SwitchFS.AddRoute(pattern, backend, opts...)` and
   `SwitchFS.RemoveRoute(pattern, type)` for changing routes while serving, and
   the `TypedRouteRemover` interface (`RemoveRouteOfType`), implemented by the
-  default router, to remove a route by pattern and type together.
+  default router, to remove a route by pattern and type together. With a
+  custom router lacking it, `RemoveRoute` returns the new `ErrAmbiguousRoute`
+  instead of removing by pattern when routes of other types share the pattern.
 - Package documentation (`doc.go`), runnable examples, and fstesting runs over
   rewriting routes and an osfs backend.
 
@@ -67,7 +89,10 @@ uses [Semantic Versioning](https://semver.org/).
   unwrapped, and backend errors that aren't `*os.PathError` pass through as is,
   so `err == ErrNoRoute` and similar comparisons keep working.
 - `Router.RemoveRoute(pattern)` still matches the pattern alone.
-- `Route.Failover` is still recorded but not used.
+- `Route.Failover` is still recorded but not used, so `ErrAllBackendsFailed`
+  and `ErrCrossBackendOperation` are never returned; their docs now say so.
+- Paths are cleaned before routing, which drops a trailing slash: `Stat("f/")`
+  on a regular file succeeds where `os.Stat` returns `ENOTDIR`.
 
 ## [1.0.0]
 

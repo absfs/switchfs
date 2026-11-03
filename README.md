@@ -92,13 +92,24 @@ Each operation resolves its path and goes to the first route that matches:
 4. A path that matches no route goes, unchanged, to the default backend
    (`WithDefault`). With no default, the operation returns `ErrNoRoute`.
 
+Names follow `os` where cleaning could change their meaning:
+
+- An empty name fails with an `*os.PathError` wrapping `ENOENT` (a
+  `*os.LinkError` for `Rename` and `Symlink`), as in `os`. It never means the
+  working directory; use `"."` for that.
+- `RemoveAll("")` returns nil and does nothing, as `os.RemoveAll` does.
+  `RemoveAll` of a name whose last element is `.` or `..` fails with `EINVAL`
+  rather than removing the directory that cleaning would make of it.
+- Cleaning drops a trailing slash, so `Stat("file.txt/")` succeeds on a
+  regular file where `os.Stat` fails with `ENOTDIR`.
+
 Three pattern types:
 
-| Type                     | Example                     | Matches                                                       |
-| ------------------------ | --------------------------- | ------------------------------------------------------------- |
-| `PatternPrefix` (default) | `/data`                     | `/data`, `/data/x/y`; not `/database` (whole components only) |
-| `PatternGlob`            | `**/*.log`                  | doublestar globs; a pattern without `/` also matches basenames |
-| `PatternRegex`           | `^/ws(/\|$)`                | Go regular expressions against the clean path                 |
+| Type                      | Example      | Matches                                                        |
+| ------------------------- | ------------ | -------------------------------------------------------------- |
+| `PatternPrefix` (default) | `/data`      | `/data`, `/data/x/y`; not `/database` (whole components only)  |
+| `PatternGlob`             | `**/*.log`   | doublestar globs; a pattern without `/` also matches basenames |
+| `PatternRegex`            | `^/ws(/\|$)` | Go regular expressions against the clean path                  |
 
 ```go
 fs, _ := switchfs.New(
@@ -117,8 +128,9 @@ combined with `And`, `Or`, `Not`, or your own `RouteCondition`). Operations
 evaluate it with the path and a **nil** `os.FileInfo`, because the file's
 backend isn't known until routing is done. The built-in metadata conditions
 treat a nil info as a match, so during operations they only filter when you
-call `Router().RouteWithInfo` yourself with real metadata; a path-based custom
-condition works everywhere.
+call `Router().RouteWithInfo` yourself with real metadata. `Not(...)` of a
+metadata condition is therefore false for every operation, so such a route
+never matches one. A path-based custom condition works everywhere.
 
 ## Path rewriting
 
@@ -129,14 +141,14 @@ including cross-backend moves), `Stat`, `Lstat`, `Chmod`, `Chtimes`, `Chown`,
 `Lchown`, `Truncate`, `ReadDir`, `ReadFile`, `Readlink`, `Symlink` (the link
 path), `Sub` and `Chdir`.
 
-| Rewriter                         | `/ws/a/b` becomes           |
-| -------------------------------- | --------------------------- |
-| `StripPrefix("/ws")`             | `/a/b` (and `/ws` becomes `/`) |
-| `AddPrefix("/srv")`              | `/srv/ws/a/b`               |
-| `ReplacePrefix("/ws", "/data")`  | `/data/a/b`                 |
-| `RegexRewrite(pattern, repl)`    | whatever the regexp makes   |
-| `StaticMapping(map)`             | the mapped path, if listed  |
-| `ChainRewriters(r1, r2, ...)`    | each applied in turn        |
+| Rewriter                        | `/ws/a/b` becomes              |
+| ------------------------------- | ------------------------------ |
+| `StripPrefix("/ws")`            | `/a/b` (and `/ws` becomes `/`) |
+| `AddPrefix("/srv")`             | `/srv/ws/a/b`                  |
+| `ReplacePrefix("/ws", "/data")` | `/data/a/b`                    |
+| `RegexRewrite(pattern, repl)`   | whatever the regexp makes      |
+| `StaticMapping(map)`            | the mapped path, if listed     |
+| `ChainRewriters(r1, r2, ...)`   | each applied in turn           |
 
 ```go
 // A backend that keeps /data/... under /storage/...
@@ -177,10 +189,10 @@ Rewriting never leaks backend paths:
 `SwitchFS` implements `absfs.SymlinkFileSystem`. `Lstat`, `Lchown`, `Readlink`
 and `Symlink` route and rewrite the link's own path like everything else.
 
-| Backend                              | `Lstat`              | `Lchown`, `Readlink`                   | `Symlink`                              |
-| ------------------------------------ | -------------------- | -------------------------------------- | -------------------------------------- |
-| implements `absfs.SymLinker`         | backend `Lstat`      | backend method                         | backend method                         |
-| no symlink support                   | falls back to `Stat` | `*os.PathError` wrapping `ErrSymlinkNotSupported` | `*os.LinkError` wrapping `ErrSymlinkNotSupported` |
+| Backend                      | `Lstat`              | `Lchown`, `Readlink`                              | `Symlink`                                         |
+| ---------------------------- | -------------------- | ------------------------------------------------- | ------------------------------------------------- |
+| implements `absfs.SymLinker` | backend `Lstat`      | backend method                                    | backend method                                    |
+| no symlink support           | falls back to `Stat` | `*os.PathError` wrapping `ErrSymlinkNotSupported` | `*os.LinkError` wrapping `ErrSymlinkNotSupported` |
 
 `ErrSymlinkNotSupported` also matches `errors.ErrUnsupported`.
 
@@ -218,6 +230,10 @@ err = fs.RemoveRoute(`^/alice(/|$)`, switchfs.PatternRegex)
   pattern **and** its type, so it never removes a same-pattern route of
   another type. (`Router().RemoveRoute(pattern)` is still there and matches the
   pattern alone, removing the highest-priority such route.)
+- With a custom `Router` that doesn't implement `TypedRouteRemover`,
+  `RemoveRoute` can only remove by pattern. It does so when no route of
+  another type shares the pattern, and otherwise returns `ErrAmbiguousRoute`
+  and removes nothing.
 - Every operation routes against the routes present when it starts. Files
   already open through a route stay usable after it is removed; new
   operations on its paths go wherever the remaining routes send them.
@@ -231,8 +247,8 @@ err = fs.RemoveRoute(`^/alice(/|$)`, switchfs.PatternRegex)
 
 ## Example: one NFS export, a workspace per directory
 
-This is how [C4](https://github.com/Avalanche-io/c4) serves agent workspaces:
-one NFSv3 export, with `/<workspace>/...` routed to that workspace's union of a
+This is the layout of [C4](https://github.com/Avalanche-io/c4)'s NFS workspace
+prototype: one NFSv3 export, with `/<workspace>/...` routed to that workspace's union of a
 private writable upper over one shared read-only lower. A new workspace is an
 empty upper directory, a union, one directory in the root listing and one
 route; nothing is copied.
@@ -344,6 +360,10 @@ Notes on this layout:
   directory holds exactly the workspace's changes.
 - Use relative symlink targets inside workspaces (see [Symlinks](#symlinks)):
   the NFS client resolves absolute targets on the client.
+- Following a link from the writable upper to a target in the shared lower
+  is the union's job, not the switch's. With unionfs v1.0.0 such a link does
+  not resolve when read through the union (with or without switchfs); it
+  needs a unionfs release newer than v1.0.0.
 
 ## Listing the parents of routes
 
@@ -378,6 +398,11 @@ one:
 - directories are copied recursively;
 - symlinks are recreated with the same target, not followed; moving one onto a
   backend without symlink support fails with `ErrSymlinkNotSupported`;
+- an existing destination is handled as `rename(2)` handles it: a file or
+  symlink replaces a file or symlink there (a symlink at the destination is
+  replaced, not written through), and fails with `EISDIR` on a directory; a
+  directory replaces only an empty directory, failing with `ENOTEMPTY` or
+  `ENOTDIR` otherwise;
 - the move is **not atomic**. A failure part way leaves what was already moved
   in place; a source file is removed only after its copy succeeded.
 
@@ -397,6 +422,10 @@ one:
   hidden.
 - `TempDir()` is the virtual path `/tmp` (or `WithTempDir`), routed like any
   other path.
+- A trailing slash is dropped by cleaning (see [Routing](#routing)), so it
+  doesn't make a backend check that the path is a directory.
+- `RemoveAll` of a route's own root removes the backend's root contents; with
+  `ReplacePrefix` onto a host directory, that is the host directory.
 
 ## Testing
 
@@ -408,9 +437,11 @@ The tests run the [fstesting](https://github.com/absfs/fstesting) conformance
 suite against SwitchFS over memfs (with symlinks), over rewriting routes
 (`StripPrefix`, `ReplacePrefix`, a C4-style regex workspace route), and over
 osfs both with and without rewriting, plus race-detector tests that add and
-remove routes while other goroutines read, write, rename and list. The
-rewriting runs leave the suite's symlink section off, because it links to
-absolute virtual paths, which by design a backend can't follow.
+remove routes and change the working directory while other goroutines read,
+write, rename and list with absolute and relative paths. The suite links to
+absolute virtual paths, which by design a backend behind a rewriting route
+can't follow, so the rewriting runs repeat its symlink group through a small
+test shim that stores those targets as relative links.
 
 ## License
 

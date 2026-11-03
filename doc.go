@@ -28,6 +28,14 @@
 //  4. With no matching route the path goes, unrewritten, to the default
 //     backend; with no default the operation returns ErrNoRoute, unwrapped.
 //
+// Where cleaning would change what a name means, SwitchFS follows package
+// os instead. An empty name fails with an *os.PathError (an *os.LinkError
+// for Rename and Symlink) wrapping ENOENT; it never means the working
+// directory. RemoveAll("") returns nil, and RemoveAll of a name whose last
+// element is "." or ".." fails with EINVAL. Cleaning does drop a trailing
+// slash, so Stat("file/") succeeds on a regular file where os.Stat fails
+// with ENOTDIR.
+//
 // # What callers see
 //
 // Callers only ever see their own (virtual) paths:
@@ -64,9 +72,12 @@
 // used with both rewritten paths, even across two routes. Otherwise the
 // tree is copied into the new backend (keeping permission bits, and
 // modification times where the backend allows; symlinks are recreated, not
-// followed) and then removed from the old one. That copy is not atomic: a
-// failure part way leaves what was moved in place, and the source is only
-// removed once its copy succeeded.
+// followed) and then removed from the old one. An existing destination is
+// handled as rename(2) handles it: a file or symlink replaces a
+// non-directory and fails with EISDIR on a directory, and a directory
+// replaces only an empty directory (ENOTEMPTY or ENOTDIR otherwise). The
+// copy is not atomic: a failure part way leaves what was moved in place,
+// and the source is only removed once its copy succeeded.
 //
 // # Dynamic routes
 //
@@ -75,7 +86,10 @@
 // router is safe for concurrent use: every operation routes against the
 // routes present when it starts, and files already open stay usable after
 // their route is removed. SwitchFS.RemoveRoute takes the pattern type as
-// well as the pattern; Router.RemoveRoute matches the pattern alone.
+// well as the pattern; Router.RemoveRoute matches the pattern alone. With a
+// custom Router that doesn't implement TypedRouteRemover, SwitchFS.RemoveRoute
+// returns ErrAmbiguousRoute rather than risk removing a same-pattern route of
+// another type.
 //
 // # Listing the parents of routes
 //
