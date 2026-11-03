@@ -47,6 +47,30 @@ func TestPrefixMatcher(t *testing.T) {
 			path:    "/tmp/file.txt",
 			want:    true,
 		},
+		{
+			name:    "prefix stops at a component boundary",
+			pattern: "/data",
+			path:    "/database/file.txt",
+			want:    false,
+		},
+		{
+			name:    "sibling with shared stem",
+			pattern: "/ws",
+			path:    "/ws2",
+			want:    false,
+		},
+		{
+			name:    "trailing slash in pattern",
+			pattern: "/data/",
+			path:    "/data/file.txt",
+			want:    true,
+		},
+		{
+			name:    "root prefix matches everything",
+			pattern: "/",
+			path:    "/anything/at/all",
+			want:    true,
+		},
 	}
 
 	for _, tt := range tests {
