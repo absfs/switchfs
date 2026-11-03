@@ -26,6 +26,7 @@ rest to other absfs filesystems you compose with it.
 - [Path rewriting](#path-rewriting)
 - [What callers see](#what-callers-see)
 - [Symlinks](#symlinks)
+- [Trailing slashes](#trailing-slashes)
 - [Changing routes while serving](#changing-routes-while-serving)
 - [Example: one NFS export, a workspace per directory](#example-one-nfs-export-a-workspace-per-directory)
 - [Listing the parents of routes](#listing-the-parents-of-routes)
@@ -100,8 +101,10 @@ Names follow `os` where cleaning could change their meaning:
 - `RemoveAll("")` returns nil and does nothing, as `os.RemoveAll` does.
   `RemoveAll` of a name whose last element is `.` or `..` fails with `EINVAL`
   rather than removing the directory that cleaning would make of it.
-- Cleaning drops a trailing slash, so `Stat("file.txt/")` succeeds on a
-  regular file where `os.Stat` fails with `ENOTDIR`.
+- A trailing slash requires a directory, as in `os`: `Stat("file.txt/")`
+  fails with not-a-directory on a regular file, and `Mkdir("dir/")` works.
+  Cleaning drops the slash before routing, so SwitchFS remembers it and
+  applies the rule itself; see [Trailing slashes](#trailing-slashes).
 
 Three pattern types:
 
@@ -210,6 +213,49 @@ fs.Symlink("v2.txt", "/ws/current")   // backend: /current -> v2.txt
 target, _ := fs.Readlink("/ws/current") // "v2.txt"
 data, _ := fs.ReadFile("/ws/current")   // contents of /ws/v2.txt
 ```
+
+## Trailing slashes
+
+A name ending in `/` must name a directory, as it must for `os`. Routing cleans
+the slash away, and it can't simply be handed to backends (`memfs.Mkdir("/e/")`
+fails), so SwitchFS notes that the caller's name had one and enforces the rule
+itself, against the object the cleaned path names in its backend:
+
+- On a regular file, or a symlink to one, `Stat`, `Lstat`, `Open`,
+  `OpenFile`, `Chmod`, `Chtimes`, `Chown`, `Lchown`, `Truncate`, `ReadDir`,
+  `ReadFile`, `Readlink`, `Remove`, `Rename` (either path) and `Chdir` fail
+  with an `*os.PathError` (`*os.LinkError` for `Rename`) wrapping the host's
+  not-a-directory error.
+- On a directory nothing changes: `Stat("dir/")`, `Mkdir("new/")`,
+  `MkdirAll("a/b/")`, `Rename("dir/", "moved/")` and `Chdir("dir/")` work.
+- A trailing slash resolves a final symlink, so `Lstat("link/")` describes the
+  directory `link` points to and `Lchown("link/")` changes it.
+- `RemoveAll` first tries `Remove` of the name, slash and all, as
+  `os.RemoveAll` does.
+
+Hosts disagree on the details, and SwitchFS does what `os` does on the host it
+runs on, whatever the backend:
+
+| With a trailing slash                      | Linux                                      | macOS                                          | Windows                    |
+| ------------------------------------------ | ------------------------------------------ | ---------------------------------------------- | -------------------------- |
+| not-a-directory error                      | `ENOTDIR`                                  | `ENOTDIR`                                      | `ERROR_DIRECTORY` (267)    |
+| `OpenFile` with `O_CREATE`                 | always `EISDIR`                            | `ENOENT` if missing                            | not-a-directory if missing |
+| `Mkdir`, `MkdirAll` on a file              | `EEXIST`                                   | `ENOTDIR`                                      | the backend's exists error |
+| `Remove`, `Rename` from a symlink to a dir | `ENOTDIR`                                  | act on the directory                           | act on the link            |
+| a dangling symlink                         | `ENOENT`; `ENOTDIR` for `Remove`, `Rename` | followed: `ENOENT`; `Mkdir` creates the target | not-a-directory            |
+| `Rename` onto a missing `new/`             | `ENOTDIR` unless the source is a directory | `ENOENT` unless the source is a directory      | slash ignored              |
+| `RemoveAll("file/")`                       | removes the file                           | removes the file                               | not-a-directory            |
+| `Readlink("dir/")`, `Readlink("link/")`    | `EINVAL`                                   | `EINVAL`                                       | reads the link             |
+| `Chown`, `Lchown`                          | checked                                    | checked                                        | not checked                |
+
+On Windows the not-a-directory error is `syscall.Errno(267)`, which `os`
+returns there. `syscall.ENOTDIR` would be wrong on Windows: it is
+`ERROR_PATH_NOT_FOUND`, which matches `fs.ErrNotExist`, so a caller testing
+`os.IsNotExist` would take a file in the way for a missing one. Code that
+checks for not-a-directory portably should do what it would do with `os`
+(test for `syscall.ENOTDIR` on Unix and 267 on Windows). Other Unix hosts get
+the Linux rules; only Linux, macOS and Windows are compared against `os` in the
+tests.
 
 ## Changing routes while serving
 
@@ -422,8 +468,11 @@ one:
   hidden.
 - `TempDir()` is the virtual path `/tmp` (or `WithTempDir`), routed like any
   other path.
-- A trailing slash is dropped by cleaning (see [Routing](#routing)), so it
-  doesn't make a backend check that the path is a directory.
+- Trailing slashes follow the host's `os`, not the backend (see
+  [Trailing slashes](#trailing-slashes)): a memfs-backed SwitchFS returns
+  `EISDIR` for `Create("x/")` on Linux and `ENOENT` on macOS. A trailing
+  `/.` or `/..` is still cleaned away, so `Stat("file.txt/.")` succeeds on a
+  regular file where `os.Stat` fails.
 - `RemoveAll` of a route's own root removes the backend's root contents; with
   `ReplacePrefix` onto a host directory, that is the host directory.
 

@@ -32,9 +32,21 @@
 // os instead. An empty name fails with an *os.PathError (an *os.LinkError
 // for Rename and Symlink) wrapping ENOENT; it never means the working
 // directory. RemoveAll("") returns nil, and RemoveAll of a name whose last
-// element is "." or ".." fails with EINVAL. Cleaning does drop a trailing
-// slash, so Stat("file/") succeeds on a regular file where os.Stat fails
-// with ENOTDIR.
+// element is "." or ".." fails with EINVAL.
+//
+// A trailing slash requires a directory, as in os. Cleaning drops it, so
+// SwitchFS remembers that the caller's name had one and checks the object
+// in the backend: on a regular file, or a symlink to one, Stat, Open,
+// Remove, Rename and the other methods fail with an *os.PathError (an
+// *os.LinkError for Rename and Symlink) wrapping the host's not-a-directory
+// error, while Mkdir("dir/") and MkdirAll work as before. The slash resolves
+// a final symlink, so Lstat("link/") describes what link points to. Where
+// hosts differ (the errno, OpenFile with O_CREATE, a symlink to a
+// directory) SwitchFS does what os does on the host it runs on, whatever
+// the backend. On Windows the error is ERROR_DIRECTORY (267), as os
+// returns there, not syscall.ENOTDIR, which on Windows is
+// ERROR_PATH_NOT_FOUND and would match fs.ErrNotExist. See the README for
+// the full table.
 //
 // # What callers see
 //

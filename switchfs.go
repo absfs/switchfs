@@ -1,6 +1,7 @@
 package switchfs
 
 import (
+	"errors"
 	"io/fs"
 	"os"
 	"path"
@@ -23,6 +24,7 @@ type SwitchFS struct {
 	router    Router
 	defaultFS absfs.FileSystem
 	tempDir   string
+	slash     slashRules // trailing-slash behaviour: the host's (see slash.go)
 
 	mu         sync.RWMutex // guards currentDir
 	currentDir string
@@ -40,6 +42,7 @@ func New(opts ...Option) (*SwitchFS, error) {
 		router:     NewRouter(),
 		currentDir: "/",
 		tempDir:    "/tmp",
+		slash:      hostSlash,
 	}
 
 	for _, opt := range opts {
@@ -130,6 +133,9 @@ func (fs *SwitchFS) Chdir(dir string) error {
 	if err != nil {
 		return err
 	}
+	if err := fs.checkSlash("chdir", dir, backend, p); err != nil {
+		return err
+	}
 	info, err := backend.Stat(p)
 	if err != nil {
 		if pe, ok := err.(*os.PathError); ok {
@@ -138,7 +144,7 @@ func (fs *SwitchFS) Chdir(dir string) error {
 		return err
 	}
 	if !info.IsDir() {
-		return &os.PathError{Op: "chdir", Path: dir, Err: syscall.ENOTDIR}
+		return &os.PathError{Op: "chdir", Path: dir, Err: fs.notDir()}
 	}
 
 	fs.mu.Lock()
@@ -167,6 +173,11 @@ func (fs *SwitchFS) OpenFile(name string, flag int, perm os.FileMode) (absfs.Fil
 	if err != nil {
 		return nil, err
 	}
+	if hasTrailingSlash(name) {
+		if err := fs.openSlash(backend, p, flag); err != nil {
+			return nil, &os.PathError{Op: "open", Path: name, Err: err}
+		}
+	}
 	f, err := backend.OpenFile(p, flag, perm)
 	if err != nil {
 		return nil, pathError(err, name)
@@ -190,7 +201,7 @@ func (fs *SwitchFS) Mkdir(name string, perm os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	return pathError(backend.Mkdir(p, perm), name)
+	return fs.mkdir(name, backend, p, perm)
 }
 
 // MkdirAll creates a directory and any missing parents. Parents are created
@@ -199,6 +210,14 @@ func (fs *SwitchFS) MkdirAll(name string, perm os.FileMode) error {
 	backend, p, err := fs.resolve("mkdir", name)
 	if err != nil {
 		return err
+	}
+	if hasTrailingSlash(name) {
+		switch classify(backend, p) {
+		case kindFile, kindLinkFile, kindLinkDangling:
+			// Something that isn't a directory is in the way: fail as
+			// Mkdir of the same name does.
+			return fs.mkdir(name, backend, p, perm)
+		}
 	}
 	return pathError(backend.MkdirAll(p, perm), name)
 }
@@ -209,7 +228,16 @@ func (fs *SwitchFS) Remove(name string) error {
 	if err != nil {
 		return err
 	}
-	return pathError(backend.Remove(p), name)
+	return fs.remove(name, backend, p)
+}
+
+// remove removes p in b for Remove(name), applying a trailing slash.
+func (fs *SwitchFS) remove(name string, b absfs.FileSystem, p string) error {
+	target, err := fs.removalPath(name, b, p)
+	if err != nil {
+		return slashError("remove", name, err)
+	}
+	return pathError(b.Remove(target), name)
 }
 
 // RemoveAll removes a path and any children it contains, in the backend the
@@ -231,6 +259,19 @@ func (fs *SwitchFS) RemoveAll(name string) error {
 	if err != nil {
 		return err
 	}
+	if hasTrailingSlash(name) {
+		// As os.RemoveAll does, try a plain Remove of the name, slash and
+		// all, first.
+		err := fs.remove(name, backend, p)
+		if err == nil || errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		// Windows then Lstats the name, which fails on a non-directory;
+		// Unix removes it without the slash.
+		if fs.slash == slashWindows && fs.lookupNotDir(classify(backend, p)) {
+			return &os.PathError{Op: "RemoveAll", Path: name, Err: fs.notDir()}
+		}
+	}
 	return pathError(backend.RemoveAll(p), name)
 }
 
@@ -251,6 +292,12 @@ func (fs *SwitchFS) Rename(oldpath, newpath string) error {
 	if err != nil {
 		return err
 	}
+	if op, err = fs.removalPath(oldpath, oldBackend, op); err != nil {
+		return linkError(err, "rename", oldpath, newpath)
+	}
+	if np, err = fs.renameDest(newpath, oldBackend, op, newBackend, np); err != nil {
+		return linkError(err, "rename", oldpath, newpath)
+	}
 
 	if sameBackend(oldBackend, newBackend) {
 		return linkError(oldBackend.Rename(op, np), "rename", oldpath, newpath)
@@ -262,6 +309,9 @@ func (fs *SwitchFS) Rename(oldpath, newpath string) error {
 func (fs *SwitchFS) Stat(name string) (os.FileInfo, error) {
 	vpath, backend, p, err := fs.resolveVirtual("stat", name)
 	if err != nil {
+		return nil, err
+	}
+	if err := fs.checkSlash("stat", name, backend, p); err != nil {
 		return nil, err
 	}
 	info, err := backend.Stat(p)
@@ -277,6 +327,9 @@ func (fs *SwitchFS) Chmod(name string, mode os.FileMode) error {
 	if err != nil {
 		return err
 	}
+	if err := fs.checkSlash("chmod", name, backend, p); err != nil {
+		return err
+	}
 	return pathError(backend.Chmod(p, mode), name)
 }
 
@@ -284,6 +337,9 @@ func (fs *SwitchFS) Chmod(name string, mode os.FileMode) error {
 func (fs *SwitchFS) Chtimes(name string, atime time.Time, mtime time.Time) error {
 	backend, p, err := fs.resolve("chtimes", name)
 	if err != nil {
+		return err
+	}
+	if err := fs.checkSlash("chtimes", name, backend, p); err != nil {
 		return err
 	}
 	return pathError(backend.Chtimes(p, atime, mtime), name)
@@ -295,6 +351,11 @@ func (fs *SwitchFS) Chown(name string, uid, gid int) error {
 	if err != nil {
 		return err
 	}
+	if fs.ownerChecksSlash() {
+		if err := fs.checkSlash("chown", name, backend, p); err != nil {
+			return err
+		}
+	}
 	return pathError(backend.Chown(p, uid, gid), name)
 }
 
@@ -302,6 +363,9 @@ func (fs *SwitchFS) Chown(name string, uid, gid int) error {
 func (fs *SwitchFS) Truncate(name string, size int64) error {
 	backend, p, err := fs.resolve("truncate", name)
 	if err != nil {
+		return err
+	}
+	if err := fs.checkSlash("truncate", name, backend, p); err != nil {
 		return err
 	}
 	return pathError(backend.Truncate(p, size), name)
@@ -321,6 +385,9 @@ func (fs *SwitchFS) ReadDir(name string) ([]fs.DirEntry, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := fs.checkSlash("open", name, backend, p); err != nil {
+		return nil, err
+	}
 	entries, err := backend.ReadDir(p)
 	if err != nil {
 		return entries, pathError(err, name)
@@ -332,6 +399,9 @@ func (fs *SwitchFS) ReadDir(name string) ([]fs.DirEntry, error) {
 func (fs *SwitchFS) ReadFile(name string) ([]byte, error) {
 	backend, p, err := fs.resolve("open", name)
 	if err != nil {
+		return nil, err
+	}
+	if err := fs.checkSlash("open", name, backend, p); err != nil {
 		return nil, err
 	}
 	data, err := backend.ReadFile(p)

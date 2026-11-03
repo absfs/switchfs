@@ -13,8 +13,9 @@ Callers that relied on the old behaviour should check `Chdir` (now fails on a
 missing or non-directory target, and with `ErrNoRoute` on an unrouted path when
 there is no default backend), `Rename` errors (now `*os.LinkError`), prefix
 matching (`/data` no longer matches `/database`), conditions (now evaluated
-during operations), empty names (now `ENOENT`), and cross-backend renames
-onto existing destinations.
+during operations), empty names (now `ENOENT`), names with a trailing slash
+(now not-a-directory on a file), and cross-backend renames onto existing
+destinations.
 
 ### Fixed
 
@@ -46,6 +47,17 @@ onto existing destinations.
   reaching the backend; `RemoveAll("")` is a no-op returning nil, and
   `RemoveAll` of a name ending in `.` or `..` fails with `EINVAL`, so cleaning
   can never turn it into a removal of the working directory.
+- **A trailing slash requires a directory**, as in `os`. Cleaning used to drop
+  it, so `Stat("file/")`, `Open`, `Lstat`, `Remove`, `Rename` and the rest
+  acted on a regular file. SwitchFS now remembers the slash and fails with the
+  host's not-a-directory error on a file or a symlink to one (`ENOTDIR` on
+  Unix; on Windows `ERROR_DIRECTORY`, as `os` returns there, which unlike
+  `syscall.ENOTDIR` doesn't match `fs.ErrNotExist`). The slash resolves a
+  final symlink (`Lstat("link/")` describes the directory), `Mkdir("dir/")`
+  and `MkdirAll` work as before, and the details that differ by host
+  (`OpenFile` with `O_CREATE`, `Mkdir` on a file, `Remove` and `Rename` of a
+  symlink to a directory, a slash on a `Rename` destination) follow `os` on
+  the host. A table-driven test compares every method with `os` on the host.
 
 ### Added
 
@@ -91,8 +103,6 @@ onto existing destinations.
 - `Router.RemoveRoute(pattern)` still matches the pattern alone.
 - `Route.Failover` is still recorded but not used, so `ErrAllBackendsFailed`
   and `ErrCrossBackendOperation` are never returned; their docs now say so.
-- Paths are cleaned before routing, which drops a trailing slash: `Stat("f/")`
-  on a regular file succeeds where `os.Stat` returns `ENOTDIR`.
 
 ## [1.0.0]
 

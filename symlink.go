@@ -16,12 +16,23 @@ func symlinker(b absfs.FileSystem) (absfs.SymLinker, bool) {
 // Lstat returns file information without following a final symlink. The
 // path is routed and rewritten like Stat. When the backend has no symlink
 // support (doesn't implement absfs.SymLinker), Lstat falls back to Stat.
+// As in os, a trailing slash resolves the final symlink: Lstat("link/")
+// describes the directory link points to, and fails on anything else.
 func (fs *SwitchFS) Lstat(name string) (os.FileInfo, error) {
 	vpath, backend, p, err := fs.resolveVirtual("lstat", name)
 	if err != nil {
 		return nil, err
 	}
-	info, err := lstat(backend, p)
+	var info os.FileInfo
+	if hasTrailingSlash(name) {
+		// A trailing slash resolves a final symlink, so this is a Stat.
+		if err := fs.checkSlash("lstat", name, backend, p); err != nil {
+			return nil, err
+		}
+		info, err = backend.Stat(p)
+	} else {
+		info, err = lstat(backend, p)
+	}
 	if err != nil {
 		return nil, pathError(err, name)
 	}
@@ -30,7 +41,9 @@ func (fs *SwitchFS) Lstat(name string) (os.FileInfo, error) {
 
 // Lchown changes the owner and group of name without following a final
 // symlink. It fails with an *os.PathError wrapping ErrSymlinkNotSupported
-// when the backend has no symlink support.
+// when the backend has no symlink support. Except on Windows, where
+// os.Lchown doesn't look at the name, a trailing slash resolves the final
+// symlink, as in os, and the directory it points to is changed.
 func (fs *SwitchFS) Lchown(name string, uid, gid int) error {
 	backend, p, err := fs.resolve("lchown", name)
 	if err != nil {
@@ -39,6 +52,17 @@ func (fs *SwitchFS) Lchown(name string, uid, gid int) error {
 	l, ok := symlinker(backend)
 	if !ok {
 		return &os.PathError{Op: "lchown", Path: name, Err: ErrSymlinkNotSupported}
+	}
+	if hasTrailingSlash(name) && fs.ownerChecksSlash() {
+		// A trailing slash resolves a final symlink, so this is a Chown of
+		// whatever the link resolves to.
+		switch k := classify(backend, p); {
+		case fs.lookupNotDir(k):
+			return &os.PathError{Op: "lchown", Path: name, Err: fs.notDir()}
+		case k == kindLinkDangling:
+			return &os.PathError{Op: "lchown", Path: name, Err: syscall.ENOENT}
+		}
+		return pathError(backend.Chown(p, uid, gid), name)
 	}
 	return pathError(l.Lchown(p, uid, gid), name)
 }
@@ -54,6 +78,9 @@ func (fs *SwitchFS) Readlink(name string) (string, error) {
 	l, ok := symlinker(backend)
 	if !ok {
 		return "", &os.PathError{Op: "readlink", Path: name, Err: ErrSymlinkNotSupported}
+	}
+	if err := fs.readlinkSlash(name, backend, p); err != nil {
+		return "", &os.PathError{Op: "readlink", Path: name, Err: err}
 	}
 	target, err := l.Readlink(p)
 	return target, pathError(err, name)
@@ -79,6 +106,9 @@ func (fs *SwitchFS) Symlink(oldname, newname string) error {
 	l, ok := symlinker(backend)
 	if !ok {
 		return &os.LinkError{Op: "symlink", Old: oldname, New: newname, Err: ErrSymlinkNotSupported}
+	}
+	if err := fs.symlinkSlash(newname, backend, p); err != nil {
+		return &os.LinkError{Op: "symlink", Old: oldname, New: newname, Err: err}
 	}
 	return linkError(l.Symlink(oldname, p), "symlink", oldname, newname)
 }
